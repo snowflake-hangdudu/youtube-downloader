@@ -1,0 +1,14 @@
+# 构建产物
+youtube-downloader.zip
+
+# 测试依赖与产物
+test/node_modules/
+test/_out/
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+Thumbs.db
