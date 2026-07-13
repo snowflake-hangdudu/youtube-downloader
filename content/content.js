@@ -12,6 +12,50 @@
 
   let muxReadyPromise = null;
 
+  /** YouTube SPA：DOM 事件优先，轮询兜底（ISOLATED 无法拦截 MAIN 的 history） */
+  function watchUrlChange(onChange, intervalMs = 2000) {
+    let lastUrl = location.href;
+    const check = () => {
+      if (location.href === lastUrl) return;
+      lastUrl = location.href;
+      onChange(lastUrl);
+    };
+    document.addEventListener('yt-navigate-finish', check);
+    document.addEventListener('yt-page-data-updated', check);
+    window.addEventListener('popstate', check);
+    setInterval(check, intervalMs);
+  }
+
+  /** content/bg 侧抛错也收成短指引（page-agent 已走 formatDownloadError） */
+  function friendlyError(msg) {
+    const m = msg || '下载失败';
+    if (m === '下载已取消') return m;
+    if (/Extension context invalidated|扩展已重载/i.test(m)) {
+      return '扩展已重载，请按 F5 刷新本页后再点下载';
+    }
+    if (/合并库|合并模块|mp4-remux|YtM4sMux|未加载/.test(m)) {
+      return '请刷新页面后重试';
+    }
+    if (/bot|机器人|LOGIN_REQUIRED|Sign in|不是机器人/i.test(m)) {
+      return '请登录并完成 YouTube「确认你不是机器人」，F5 后再试';
+    }
+    if (/未捕获|请.*播放|请先播放|无下载地址|无可用地址|嗅探/.test(m)) {
+      return '请先播放目标清晰度 5～10 秒，再点下载';
+    }
+    if (/文件过大|改选较低/.test(m)) {
+      return '文件过大，请改选较低清晰度（如 720P）';
+    }
+    if (/403|HTTP 4|过小|空壳|疑似|假死|background.*(失败|下载)/i.test(m)) {
+      return '下载失败。请先播放 5～10 秒，或改选 720P 后重试';
+    }
+    if (/超时|timeout/i.test(m)) {
+      return '请求超时，请刷新页面后重试';
+    }
+    if (/请先|请改选|请刷新|F5|720P/.test(m) && m.length < 90) return m;
+    return m;
+  }
+
+  /** MAIN world 注入（合并库跑在页面上下文） */
   function setupMuxInPage() {
     if (muxReadyPromise) return muxReadyPromise;
     const base = chrome.runtime.getURL('lib/');
@@ -26,6 +70,66 @@
     return muxReadyPromise;
   }
   setupMuxInPage().catch(() => {});
+
+  function agentCall(type, payload, transferList) {
+    return new Promise((resolve, reject) => {
+      const id = 'req-' + (++reqId);
+      pending.set(id, { resolve, reject });
+      const msg = { source: PANEL, id, type, ...payload };
+      if (transferList?.length) {
+        window.postMessage(msg, '*', transferList);
+      } else {
+        window.postMessage(msg, '*');
+      }
+      setTimeout(() => {
+        if (pending.has(id)) {
+          pending.delete(id);
+          reject(new Error('页面代理超时，请刷新页面重试'));
+        }
+      }, 600000);
+    });
+  }
+
+  /**
+   * 合并：用 transferable 把 ArrayBuffer 所有权交给 MAIN（零拷贝），
+   * 避免几十 MB 结构化克隆把页面卡死 →「进度停住 / 无法合成」。
+   */
+  async function mergeBuffersViaPage(videoBuffer, audioBuffer) {
+    await setupMuxInPage();
+    const transfer = [];
+    const toBuf = (buf) => {
+      if (!buf) return buf;
+      if (buf instanceof ArrayBuffer) {
+        transfer.push(buf);
+        return buf;
+      }
+      if (ArrayBuffer.isView(buf)) {
+        if (buf.byteOffset === 0 && buf.byteLength === buf.buffer.byteLength) {
+          transfer.push(buf.buffer);
+          return buf.buffer;
+        }
+        const copy = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+        transfer.push(copy);
+        return copy;
+      }
+      return buf;
+    };
+    const videoBuf = toBuf(videoBuffer);
+    const audioBuf = toBuf(audioBuffer);
+    const vLen = videoBuf?.byteLength || 0;
+    const aLen = audioBuf?.byteLength || 0;
+    if (vLen < 1024) throw new Error('视频数据为空');
+    if (aLen < 256) throw new Error('音频数据为空');
+    const merged = await agentCall(
+      'MERGE_BUFFERS',
+      { videoBuffer: videoBuf, audioBuffer: audioBuf },
+      transfer
+    );
+    if (!merged?.blob || merged.blob.size < 50 * 1024) {
+      throw new Error('合并结果过小');
+    }
+    return merged.blob;
+  }
 
   function downloadBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
@@ -106,20 +210,6 @@
       else reject(new Error(error || '请求失败'));
     }
   });
-
-  function agentCall(type, payload) {
-    return new Promise((resolve, reject) => {
-      const id = 'req-' + (++reqId);
-      pending.set(id, { resolve, reject });
-      window.postMessage({ source: PANEL, id, type, ...payload }, '*');
-      setTimeout(() => {
-        if (pending.has(id)) {
-          pending.delete(id);
-          reject(new Error('页面代理超时，请刷新页面重试'));
-        }
-      }, 600000);
-    });
-  }
 
   function agentSignal(type) {
     window.postMessage({ source: PANEL, type }, '*');
@@ -226,6 +316,18 @@
               </div>
             </div>
             <div id="yt-dl-status" class="yt-dl-status hidden"></div>
+
+            <details id="yt-dl-debug" class="yt-dl-debug" open>
+              <summary class="yt-dl-debug-summary">
+                <span>调试日志</span>
+                <span id="yt-dl-debug-count" class="yt-dl-debug-count">0</span>
+                <span class="yt-dl-debug-actions">
+                  <button type="button" id="yt-dl-debug-copy" class="yt-dl-debug-btn">复制</button>
+                  <button type="button" id="yt-dl-debug-clear" class="yt-dl-debug-btn">清空</button>
+                </span>
+              </summary>
+              <pre id="yt-dl-debug-log" class="yt-dl-debug-log"></pre>
+            </details>
           </div>
           <div class="yt-dl-footer">
             <span class="yt-dl-footer-text">当前页面 · YouTube 视频页</span>
@@ -272,13 +374,66 @@
     const pauseBtn = panel.querySelector('#yt-dl-pause');
     const cancelDlBtn = panel.querySelector('#yt-dl-cancel-dl');
     const statusEl = panel.querySelector('#yt-dl-status');
+    const debugLogEl = panel.querySelector('#yt-dl-debug-log');
+    const debugCountEl = panel.querySelector('#yt-dl-debug-count');
+    const debugClearBtn = panel.querySelector('#yt-dl-debug-clear');
+    const debugCopyBtn = panel.querySelector('#yt-dl-debug-copy');
     const btnDefaultHtml = startBtn.innerHTML;
+    const debugLines = [];
+    const DEBUG_MAX = 300;
 
     function setQueueLabel(count) {
       queueLabelEl.textContent = count > 1 ? `队列下载全部 ${count} 个分 P` : '队列下载全部分 P';
     }
 
-    debugLog = (step, msg) => console.log('[YtDL]', step, msg);
+    function appendDebugLine(step, msg) {
+      const t = new Date();
+      const ts =
+        String(t.getHours()).padStart(2, '0') +
+        ':' +
+        String(t.getMinutes()).padStart(2, '0') +
+        ':' +
+        String(t.getSeconds()).padStart(2, '0');
+      const line = `[${ts}] ${step}: ${msg}`;
+      debugLines.push(line);
+      if (debugLines.length > DEBUG_MAX) debugLines.splice(0, debugLines.length - DEBUG_MAX);
+      if (debugLogEl) {
+        debugLogEl.textContent = debugLines.join('\n');
+        debugLogEl.scrollTop = debugLogEl.scrollHeight;
+      }
+      if (debugCountEl) debugCountEl.textContent = String(debugLines.length);
+    }
+
+    debugLog = (step, msg) => {
+      console.log('[YtDL]', step, msg);
+      appendDebugLine(step, typeof msg === 'string' ? msg : JSON.stringify(msg));
+    };
+
+    debugClearBtn?.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      debugLines.length = 0;
+      if (debugLogEl) debugLogEl.textContent = '';
+      if (debugCountEl) debugCountEl.textContent = '0';
+    });
+
+    debugCopyBtn?.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const text = debugLines.join('\n');
+      try {
+        await navigator.clipboard.writeText(text);
+        debugCopyBtn.textContent = '已复制';
+        setTimeout(() => {
+          debugCopyBtn.textContent = '复制';
+        }, 1200);
+      } catch (_) {
+        debugCopyBtn.textContent = '失败';
+        setTimeout(() => {
+          debugCopyBtn.textContent = '复制';
+        }, 1200);
+      }
+    });
 
     showStatus = (type, text) => {
       statusEl.classList.remove('hidden', 'success', 'error');
@@ -294,7 +449,7 @@
     }
 
     const STEP_LABELS = {
-      prepare: '准备下载',
+      prepare: '准备中',
       download: '下载视频',
       video: '下载视频',
       audio: '下载音频',
@@ -348,6 +503,8 @@
       if (/过大/.test(msg)) return 'file-size';
       if (/合成|合并/.test(msg)) return 'merge-slow';
       if (/取消/.test(msg)) return null;
+      if (/bot|机器人|登录|LOGIN/i.test(msg)) return 'login';
+      if (/清晰度|720P|质量|quality/i.test(msg)) return 'quality';
       return 'download-fail';
     }
 
@@ -434,7 +591,8 @@
 
       if (tot > 0) {
         const displayPct = Math.min(100, Math.max(0, pct >= 0 ? pct : Math.round((recv / tot) * 100)));
-        progressPct.textContent = formatBytes(recv) + ' / ' + formatBytes(tot);
+        progressPct.textContent = formatBytes(recv) + ' / ' + formatBytes(tot)
+          + (displayPct < 100 ? ' · ' + displayPct + '%' : '');
         progressBar.style.width = displayPct + '%';
         progressBar.classList.remove('indeterminate');
         progressPct.classList.remove('hidden');
@@ -442,7 +600,7 @@
       }
 
       if (recv > 0) {
-        progressPct.textContent = formatBytes(recv);
+        progressPct.textContent = '已收 ' + formatBytes(recv);
         progressBar.classList.add('indeterminate');
         progressPct.classList.remove('hidden');
         return;
@@ -454,8 +612,10 @@
         progressBar.classList.remove('indeterminate');
         progressPct.classList.remove('hidden');
       } else {
+        // 尚无字节：转圈 + 文案，避免空白像“卡住”
         progressBar.classList.add('indeterminate');
-        progressPct.classList.add('hidden');
+        progressPct.textContent = STEP_LABELS[step] || '连接中…';
+        progressPct.classList.remove('hidden');
       }
     };
 
@@ -486,7 +646,7 @@
         selectedQn = qualities[0].qn;
       }
       pillsEl.innerHTML = qualities.map((q) =>
-        `<button type="button" class="yt-dl-pill${q.qn === selectedQn ? ' active' : ''}" data-qn="${q.qn}">${q.label}</button>`
+        `<button type="button" class="yt-dl-pill${q.qn === selectedQn ? ' active' : ''}" data-qn="${q.qn}" title="${q.mode || ''}">${q.label}${q.mode === 'hls' ? ' HLS' : ''}</button>`
       ).join('');
       pillsEl.querySelectorAll('.yt-dl-pill[data-qn]').forEach((btn) => {
         btn.onclick = () => {
@@ -530,6 +690,7 @@
         setVideoLoading(false);
         titleEl.textContent = videoInfo.title;
         setDetect('已识别视频页面', true);
+        debugLog('快照', `HLS档=${(snap.qualities || []).filter((q) => q.mode === 'hls').map((q) => q.label).join(',') || '无'} · 全部=${(snap.qualities || []).map((q) => q.label + '/' + q.mode).join(', ')}`);
 
         if (videoInfo.author) {
           authorEl.textContent = videoInfo.author;
@@ -584,7 +745,7 @@
         maxLabelEl.textContent = snap.maxLabel ? `源最高 ${snap.maxLabel}` : '源最高 —';
         setLoginHint(snap.loginHint);
         renderQualityPills(snap.qualities);
-        if (snap.qualities.some((q) => q.mode === 'dash')) {
+        if (snap.qualities.some((q) => q.mode === 'dash' || q.mode === 'sniff' || q.mode === 'hls')) {
           setupMuxInPage().catch(() => {});
         }
         startBtn.disabled = !snap.qualities.length;
@@ -594,10 +755,11 @@
         setDetect('识别失败', false);
         setVideoLoading(false);
         titleEl.textContent = '加载失败';
-        subEl.textContent = err.message;
+        const tip = friendlyError(err.message);
+        subEl.textContent = tip;
         coverPh.classList.remove('hidden');
         coverSk.classList.add('hidden');
-        showErrorWithFaq(err.message, 'download-fail');
+        showErrorWithFaq(tip, errorFaqAnchor(tip));
         debugLog('错误', err.message);
       }
     }
@@ -622,11 +784,14 @@
       if (!downloading) return;
       queueCancelled = true;
       agentSignal('CANCEL_DOWNLOAD');
+      chrome.runtime.sendMessage({ type: 'YT_DL_BG_ABORT' }).catch(() => {});
     };
 
     async function ensureMuxReady() {
       const sel = qualities.find((q) => q.qn === selectedQn);
-      if (sel?.mode !== 'dash') return true;
+      // HLS 预合并 / 一体流不需要 mux
+      if (!sel || sel.mode === 'hls' || sel.mode === 'durl') return true;
+      if (sel.mode !== 'dash' && sel.mode !== 'sniff') return true;
       try {
         await setupMuxInPage();
         return true;
@@ -636,13 +801,280 @@
       }
     }
 
+    async function mergeBgSniff(urls, itag) {
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          type: 'YT_DL_GET_SNIFFED',
+          itag: itag || null
+        });
+        if (!resp?.ok) return urls || [];
+        console.log('[YtDL:content] bg嗅探', {
+          itag,
+          hit: (resp.urls || []).length,
+          any: (resp.any || []).length,
+          itags: resp.itags
+        });
+        const merged = [];
+        const seen = new Set();
+        for (const u of [...(resp.urls || []), ...(urls || [])]) {
+          if (!u || seen.has(u)) continue;
+          seen.add(u);
+          merged.push(u);
+        }
+        // 同 itag 没有时，不轻易用 any（可能是别的清晰度）
+        return merged;
+      } catch (e) {
+        console.warn('[YtDL:content] bg嗅探失败', e);
+        return urls || [];
+      }
+    }
+
+    async function bgFetchConcat(urls, filename, step, userAgent) {
+      if (!chrome.runtime?.id) {
+        throw new Error('扩展已重载，请按 F5 刷新页面后再下载');
+      }
+      debugLog('bg', `HLS 分片合并 ${urls.length} 条`);
+      const resp = await chrome.runtime.sendMessage({
+        type: 'YT_DL_BG_FETCH_CONCAT',
+        urls,
+        filename,
+        step: step || 'download',
+        userAgent: userAgent || null
+      });
+      console.log('[YtDL:content] bgFetchConcat', {
+        ok: resp?.ok,
+        error: resp?.error,
+        bytes: resp?.buffer?.byteLength
+      });
+      if (!resp?.ok) throw new Error(resp?.error || 'HLS background 合并失败');
+      return resp;
+    }
+
+    async function bgFetch(urls, filename, step, userAgent, itag) {
+      if (!chrome.runtime?.id) {
+        throw new Error('扩展已重载，请按 F5 刷新页面后再下载');
+      }
+      const finalUrls = await mergeBgSniff(urls, itag);
+      if (!finalUrls.length) {
+        throw new Error('无可用地址（扩展未捕获到播放器请求）。请先播放目标清晰度几秒');
+      }
+      debugLog(
+        'bg',
+        `后台下载 · ${step || 'download'} · 候选 ${finalUrls.length} 条`
+      );
+      console.log('[YtDL:content] bgFetch', {
+        step,
+        n: finalUrls.length,
+        ua: userAgent ? String(userAgent).slice(0, 40) : 'default',
+        sample: (finalUrls[0] || '').slice(0, 120)
+      });
+      let ticks = 0;
+      const hb = setInterval(() => {
+        ticks += 1;
+        debugLog('bg', `${step || 'download'} 进行中… ${ticks * 8}s（进度条应在涨；若长时间不动会自动换线路）`);
+      }, 8000);
+      let resp;
+      try {
+        resp = await chrome.runtime.sendMessage({
+          type: 'YT_DL_BG_FETCH',
+          urls: finalUrls,
+          filename,
+          step: step || 'download',
+          userAgent: userAgent || null
+        });
+      } catch (e) {
+        const m = e?.message || String(e);
+        if (/Extension context invalidated|context invalidated/i.test(m)) {
+          throw new Error('扩展已重载，请按 F5 刷新页面后再下载');
+        }
+        throw e;
+      } finally {
+        clearInterval(hb);
+      }
+      console.log('[YtDL:content] bgFetch 结果', {
+        ok: resp?.ok,
+        error: resp?.error,
+        mode: resp?.mode,
+        usedIndex: resp?.usedIndex,
+        probes: resp?.probes,
+        bytes: resp?.buffer?.byteLength,
+        size: resp?.size
+      });
+      if (!resp?.ok) {
+        throw new Error(resp?.error || 'background 下载失败（无详细信息）');
+      }
+      debugLog(
+        'bg',
+        `${step || 'download'} 完成 · ${((resp.buffer?.byteLength || resp.size || 0) / 1024 / 1024).toFixed(1)}MB`
+      );
+      return resp;
+    }
+
     async function runSingleDownload(info) {
+      const sel = qualities.find((q) => q.qn === selectedQn);
       const result = await agentCall('START_DOWNLOAD', {
         aid: info.aid,
         cid: info.cid,
         qn: selectedQn,
-        title: info.title
+        title: info.title,
+        itag: sel?.itag || null,
+        client: sel?.client || null,
+        mode: sel?.mode || null,
+        hlsUrl: sel?.hlsUrl || null
       });
+
+      console.log('[YtDL:content] START_DOWNLOAD', result && Object.keys(result), result);
+
+      // 视频已在页面下完、音频失败：background 只补音频，再合并内存中的视频
+      if (result?.needBgAudio) {
+        const ua = result.userAgent || null;
+        debugLog(
+          '音频',
+          `视频已就绪 ${(result.videoBytes / 1024 / 1024).toFixed(1)}MB，改 background 拉音频`
+        );
+        updateProgress('audio', 0);
+        try {
+          const aResp = await bgFetch(
+            result.audioUrls || [],
+            'audio.m4a',
+            'audio',
+            ua,
+            result.audioItag || null
+          );
+          if (!aResp.buffer || aResp.buffer.byteLength < 1024) {
+            throw new Error('background 音频过小');
+          }
+          updateProgress('merge', 5);
+          await setupMuxInPage();
+          const transfer = [];
+          if (aResp.buffer instanceof ArrayBuffer) transfer.push(aResp.buffer);
+          const merged = await agentCall(
+            'MERGE_PENDING_VIDEO',
+            {
+              audioBuffer: aResp.buffer,
+              filename: result.filename || 'youtube.mp4'
+            },
+            transfer
+          );
+          updateProgress('save', 100);
+          return { merged: true, bytes: merged?.size || 0, via: 'bg-audio' };
+        } catch (e) {
+          console.warn('[YtDL:content] background 音频也失败，仅存视频', e);
+          debugLog('音频', 'background 也失败，仅保存视频轨: ' + (e.message || e));
+          try {
+            await agentCall('SAVE_PENDING_VIDEO', {
+              filename: result.videoOnlyFilename || 'video.mp4'
+            });
+          } catch (e2) {
+            throw new Error('音频失败且保存视频轨失败: ' + (e2.message || e2));
+          }
+          updateProgress('save', 100);
+          return { videoOnly: true, audioFailed: true };
+        }
+      }
+
+      // 一体流 / DASH / HLS：均可能由 background 拉
+      if (result?.bgFetch) {
+        const ua = result.userAgent || null;
+        if (result.hls) {
+          updateProgress('download', 0);
+          const resp = await bgFetchConcat(
+            result.urls || [],
+            result.filename || 'youtube.mp4',
+            'download',
+            ua
+          );
+          if (!resp.buffer || resp.buffer.byteLength < 50 * 1024) {
+            throw new Error('HLS 合并结果过小（' + (resp.buffer?.byteLength || 0) + ' bytes）');
+          }
+          const blob = new Blob([resp.buffer], { type: resp.mime || 'video/mp4' });
+          updateProgress('save', 95);
+          await downloadBlob(blob, resp.filename || result.filename || 'youtube.mp4');
+          updateProgress('save', 100);
+          return { hls: true, bg: true, bytes: resp.buffer.byteLength };
+        }
+        if (result.dash) {
+          updateProgress('video', 0);
+          const vResp = await bgFetch(
+            result.videoUrls || [],
+            result.videoOnlyFilename || 'video.mp4',
+            'video',
+            ua,
+            result.itag || null
+          );
+          if (vResp.mode === 'downloads') {
+            if ((vResp.size || 0) < 50 * 1024) throw new Error('视频文件过小');
+            return { via: 'downloads', downloadId: vResp.downloadId };
+          }
+          if (!vResp.buffer || vResp.buffer.byteLength < 50 * 1024) {
+            throw new Error('视频数据过小（' + (vResp.buffer?.byteLength || 0) + ' bytes）');
+          }
+
+          if (!(result.audioUrls || []).length) {
+            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
+            await downloadBlob(vBlob, result.videoOnlyFilename || result.filename || 'video.mp4');
+            updateProgress('save', 100);
+            return { videoOnly: true };
+          }
+
+          updateProgress('audio', 0);
+          let aResp;
+          try {
+            aResp = await bgFetch(result.audioUrls, 'audio.m4a', 'audio', ua, result.audioItag || null);
+          } catch (e) {
+            console.warn('[YtDL:content] 音频失败，仅存视频轨', e);
+            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
+            await downloadBlob(vBlob, result.videoOnlyFilename || 'video.mp4');
+            updateProgress('save', 100);
+            return { videoOnly: true };
+          }
+
+          if (aResp.mode === 'downloads' || !aResp.buffer || aResp.buffer.byteLength < 1024) {
+            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
+            await downloadBlob(vBlob, result.videoOnlyFilename || 'video.mp4');
+            updateProgress('save', 100);
+            return { videoOnly: true };
+          }
+
+          const totalBytes = vResp.buffer.byteLength + aResp.buffer.byteLength;
+          updateProgress('merge', 5, totalBytes, totalBytes);
+          debugLog(
+            '合并',
+            `页面合成（零拷贝移交）· 视频 ${(vResp.buffer.byteLength / 1024 / 1024).toFixed(1)}MB + 音频 ${(aResp.buffer.byteLength / 1024 / 1024).toFixed(1)}MB`
+          );
+          const mergedBlob = await mergeBuffersViaPage(vResp.buffer, aResp.buffer);
+          updateProgress('save', 95);
+          await downloadBlob(mergedBlob, result.filename || 'youtube.mp4');
+          updateProgress('save', 100);
+          return { merged: true, bytes: mergedBlob.size };
+        }
+
+        updateProgress('download', 0);
+        const resp = await bgFetch(
+          result.urls || [],
+          result.filename || 'youtube.mp4',
+          'download',
+          ua,
+          result.itag || null
+        );
+        if (resp.mode === 'downloads') {
+          if ((resp.size || 0) < 50 * 1024) {
+            throw new Error('浏览器下载文件过小（' + (resp.size || 0) + ' bytes），已视为失败');
+          }
+          updateProgress('save', 100);
+          return { dash: false, via: 'downloads', downloadId: resp.downloadId, size: resp.size };
+        }
+        if (!resp.buffer || resp.buffer.byteLength < 50 * 1024) {
+          throw new Error(
+            '后台返回数据过小（' + (resp.buffer?.byteLength || 0) + ' bytes），拒绝保存空文件'
+          );
+        }
+        const blob = new Blob([resp.buffer], { type: 'video/mp4' });
+        updateProgress('save', 95);
+        await downloadBlob(blob, resp.filename || result.filename || 'youtube.mp4');
+        updateProgress('save', 100);
+        return { dash: false, bg: true, probes: resp.probes, bytes: resp.buffer.byteLength };
+      }
 
       if (result.merged) {
         updateProgress('save', 95);
@@ -672,18 +1104,34 @@
         const result = await runSingleDownload(videoInfo);
         hideProgress();
         if (result.videoOnly) {
-          showStatus('success', '已下载视频轨（无音频）');
+          showStatus(
+            'success',
+            result.audioFailed
+              ? '视频已保存（无声音）。音频轨下载失败，可改较低清晰度重试'
+              : '已下载视频轨（无音频）'
+          );
+        } else if (result.via === 'downloads') {
+          showStatus('success', '已交给浏览器下载，请查看右上角下载栏');
+        } else if (result.hls) {
+          showStatus(
+            'success',
+            result.ext === 'ts'
+              ? 'HLS 下载完成（.ts，可用 VLC 播放）'
+              : 'HLS 下载完成，已保存'
+          );
         } else {
           showStatus('success', '下载完成，已保存为 MP4');
         }
       } catch (err) {
         hideProgress();
-        if (err.message === '下载已取消') {
+        console.error('[YtDL:content] 下载失败', err);
+        let msg = friendlyError(err.message || String(err));
+        if (msg === '下载已取消') {
           showStatus('error', '下载已取消');
         } else {
-          showErrorWithFaq(err.message, errorFaqAnchor(err.message));
+          showErrorWithFaq(msg, errorFaqAnchor(msg));
         }
-        debugLog('错误', err.message);
+        debugLog('错误', err.message || String(err));
       } finally {
         startBtn.disabled = false;
         queueBtn.disabled = false;
@@ -774,28 +1222,52 @@
         isOpen = true;
         menu.classList.remove('hidden');
         await loadVideoInfo();
-      }
-    };
-
-    let lastUrl = location.href;
-    setInterval(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
+      },
+      onNavigate: () => {
         pageIndex = 0;
         videoInfo = null;
         selectedQn = 0;
         if (isOpen) loadVideoInfo();
       }
-    }, 1000);
+    };
   }
 
   function waitAndMount() {
-    if (document.body) mountUI();
-    else setTimeout(waitAndMount, 100);
+    if (!document.body) {
+      setTimeout(waitAndMount, 100);
+      return;
+    }
+    // YouTube SPA：仅在 watch / shorts 页挂载悬浮按钮
+    const isVideoPage = () =>
+      /[?&]v=/.test(location.search) ||
+      location.pathname.startsWith('/shorts/') ||
+      location.pathname.startsWith('/watch');
+    const syncMount = () => {
+      const root = document.getElementById('yt-dl-panel-root');
+      if (isVideoPage()) {
+        if (!root) {
+          mountUI();
+        } else if (window.__YT_DL_API__?.onNavigate) {
+          window.__YT_DL_API__.onNavigate();
+        }
+      } else if (root) {
+        root.remove();
+        window.__YT_DL_API__ = null;
+      }
+    };
+    syncMount();
+    watchUrlChange(syncMount, 1500);
   }
   waitAndMount();
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type === 'YT_DL_BG_PROGRESS') {
+      if (typeof updateProgress === 'function') {
+        updateProgress(msg.step || 'download', msg.percent, msg.received, msg.total);
+      }
+      return;
+    }
+
     const api = window.__YT_DL_API__;
     if (!api) {
       sendResponse({ ok: false, error: '页面未就绪，请刷新后重试' });

@@ -4,7 +4,7 @@
   "name": "__MSG_extName__",
   "version": "1.0.0",
   "description": "__MSG_extDesc__",
-  "permissions": ["activeTab", "scripting"],
+  "permissions": ["activeTab", "scripting", "downloads", "webRequest"],
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://m.youtube.com/*",
@@ -17,10 +17,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://www.youtube.com/watch*",
-        "https://m.youtube.com/watch*",
-        "https://www.youtube.com/shorts/*",
-        "https://m.youtube.com/shorts/*"
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*"
       ],
       "js": ["content/page-agent.js"],
       "run_at": "document_start",
@@ -28,10 +26,8 @@
     },
     {
       "matches": [
-        "https://www.youtube.com/watch*",
-        "https://m.youtube.com/watch*",
-        "https://www.youtube.com/shorts/*",
-        "https://m.youtube.com/shorts/*"
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*"
       ],
       "js": ["content/content.js"],
       "css": ["content/content.css"],

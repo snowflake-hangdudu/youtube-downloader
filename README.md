@@ -2,14 +2,14 @@
 
 Microsoft Edge / Chrome 浏览器扩展（Manifest V3）。在 YouTube 视频页保存视频为 MP4，仅供个人学习使用。
 
-- 版本：1.0.0（**骨架**：结构已对齐 B 站插件，下载功能开发中）
+- 版本：1.0.0（结构对齐 B 站插件；下载可用，持续调优）
 - 反馈 QQ：748604487
 - 对照项目：[`bilibili-downloader`](../bilibili-downloader)
 
-## 功能概览（目标）
+## 功能概览
 
 - 在 YouTube **watch / Shorts** 页保存 MP4
-- 右下角悬浮面板：视频信息、清晰度、进度、暂停/继续/取消
+- 右下角悬浮面板：视频信息、清晰度、进度、暂停/继续/取消、调试日志
 - 工具栏 popup：视频页预览；非视频页引导
 - 完全免费，不收集用户数据
 
@@ -19,7 +19,9 @@ Microsoft Edge / Chrome 浏览器扩展（Manifest V3）。在 YouTube 视频页
 |------|------|
 | 项目结构 / 打包 / i18n / 双入口 UI | ✅ |
 | 识别标题、封面、作者 | ✅ |
-| 清晰度列表 / 下载 / 合并 | ⏳ 待实现 |
+| 清晰度列表（InnerTube，含 android_vr 高清） | ✅ |
+| 下载 MP4（background 顺序拉取 + DASH 合并） | ✅ |
+| HLS / WEB SABR | ⚠️ 环境相关，见 DEVELOPER.md |
 
 ## 帮助与隐私
 

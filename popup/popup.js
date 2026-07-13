@@ -63,10 +63,23 @@ function showState(name) {
   });
 }
 
+/** 必须在 MAIN world 执行：ytInitialPlayerResponse / getPlayerResponse 在隔离世界不可见 */
 function readPageState() {
-  const pr = window.ytInitialPlayerResponse;
+  const videoId = new URLSearchParams(location.search).get('v')
+    || (location.pathname.startsWith('/shorts/') ? location.pathname.split('/')[2] : null);
+
+  let pr = null;
+  try {
+    const player = document.getElementById('movie_player')
+      || document.querySelector('.html5-video-player');
+    if (player && typeof player.getPlayerResponse === 'function') {
+      pr = player.getPlayerResponse();
+    }
+  } catch (_) {}
+  if (!pr?.videoDetails) pr = window.ytInitialPlayerResponse || null;
+
   const vd = pr?.videoDetails;
-  if (vd) {
+  if (vd && (!videoId || !vd.videoId || vd.videoId === videoId)) {
     const thumbs = vd.thumbnail?.thumbnails || [];
     return {
       title: vd.title,
@@ -74,15 +87,32 @@ function readPageState() {
       pic: thumbs.length ? thumbs[thumbs.length - 1].url : '',
       view: Number(vd.viewCount) || 0,
       pubdate: 0,
-      pages: 1
+      pages: 1,
+      videoId: vd.videoId || videoId
     };
   }
-  return null;
+
+  // DOM 兜底
+  const title =
+    document.querySelector('meta[property="og:title"]')?.content ||
+    document.title.replace(/\s*-\s*YouTube\s*$/i, '').trim();
+  if (!title || !videoId) return null;
+  return {
+    title,
+    author: document.querySelector('#channel-name a')?.textContent?.trim() || '',
+    pic: document.querySelector('meta[property="og:image"]')?.content
+      || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    view: 0,
+    pubdate: 0,
+    pages: 1,
+    videoId
+  };
 }
 
 async function fallbackFromPage(tabId) {
   const [{ result }] = await chrome.scripting.executeScript({
     target: { tabId },
+    world: 'MAIN',
     func: readPageState
   });
   return result;
@@ -103,9 +133,16 @@ function renderVideo(data) {
   }
 
   const parts = [];
-  if (info.view) parts.push(formatView(info.view) + ' 播放');
+  if (info.view) parts.push(formatView(info.view) + ' 次观看');
+  if (info.duration) {
+    const s = Math.max(0, Math.floor(Number(info.duration) || 0));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    parts.push(h ? `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}` : `${m}:${String(r).padStart(2, '0')}`);
+  }
   if (info.pubdate) parts.push(formatTime(info.pubdate));
-  $('video-sub').textContent = parts.length ? parts.join(' · ') : 'YouTube视频';
+  $('video-sub').textContent = parts.length ? parts.join(' · ') : (info.videoId || 'YouTube 视频');
 
   const cover = $('video-cover');
   const coverPh = $('video-cover-ph');
@@ -154,7 +191,8 @@ function renderVideo(data) {
     loginHintEl.classList.add('hidden');
   }
 
-  $('btn-open-panel').disabled = !qualities.length;
+  // 第一步只要识别到视频就可打开面板；清晰度可为空
+  $('btn-open-panel').disabled = false;
 }
 
 async function init() {

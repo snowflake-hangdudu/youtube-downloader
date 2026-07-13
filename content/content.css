@@ -62,7 +62,7 @@
   position: absolute;
   bottom: 76px;
   right: 0;
-  width: 400px;
+  width: 420px;
   max-width: calc(100vw - 32px);
   background: var(--ytd-surface);
   border: 1px solid var(--ytd-border);
@@ -137,6 +137,76 @@
 .yt-dl-body {
   padding: 14px 16px 16px;
   background: var(--ytd-bg);
+  max-height: min(78vh, 720px);
+  overflow-y: auto;
+}
+
+.yt-dl-debug {
+  margin-top: 12px;
+  border: 1px solid var(--ytd-border);
+  border-radius: 12px;
+  background: #0f172a;
+  color: #e2e8f0;
+  overflow: hidden;
+}
+
+.yt-dl-debug-summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  user-select: none;
+}
+
+.yt-dl-debug-summary::-webkit-details-marker {
+  display: none;
+}
+
+.yt-dl-debug-count {
+  margin-left: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.25);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.yt-dl-debug-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.yt-dl-debug-btn {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(30, 41, 59, 0.9);
+  color: #cbd5e1;
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.yt-dl-debug-btn:hover {
+  background: rgba(51, 65, 85, 0.95);
+  color: #fff;
+}
+
+.yt-dl-debug-log {
+  margin: 0;
+  padding: 0 10px 10px;
+  max-height: 160px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #94a3b8;
 }
 
 .yt-dl-detect {
@@ -317,7 +387,7 @@
 }
 
 .yt-dl-video-author::before {
-  content: 'UP · ';
+  content: '频道 · ';
   color: var(--ytd-text-muted);
   font-weight: 400;
 }
