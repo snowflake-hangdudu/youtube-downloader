@@ -55,12 +55,10 @@
       if (typeof debugLog === 'function') debugLog('bg', m);
       else console.log('[YtDL]', m);
     };
-    dlog(
-      `分块取回开始 · ${chunks} 片×${formatBytes(chunkSize)} · 期望 ${formatBytes(expect)}` +
-        ` · enc=${resp.encoding || 'bin'}`
-    );
+    dlog(`分块取回 · ${chunks} 片 · ${formatBytes(expect)}`);
     const parts = [];
     let got = 0;
+    let lastPct = -1;
     for (let i = 0; i < chunks; i++) {
       const r = await chrome.runtime.sendMessage({
         type: 'YT_DL_BG_GET_CHUNK',
@@ -94,8 +92,10 @@
       }
       parts.push(u8);
       got += u8.byteLength;
-      if (i === 0 || i === chunks - 1 || (i + 1) % 8 === 0) {
-        dlog(`分块取回 ${i + 1}/${chunks} · ${formatBytes(got)}/${formatBytes(expect)}`);
+      const pct = expect ? Math.round((got / expect) * 100) : Math.round(((i + 1) / chunks) * 100);
+      if (i === chunks - 1 || pct - lastPct >= 25) {
+        lastPct = pct;
+        dlog(`分块取回 ${pct}% · ${formatBytes(got)}/${formatBytes(expect)}`);
       }
     }
     try {
@@ -161,7 +161,7 @@
     if (/Extension context invalidated|扩展已重载/i.test(m)) {
       return '扩展已重载，请按 F5 刷新本页后再点下载';
     }
-    if (/合并库|合并模块|mp4-remux|YtM4sMux|未加载/.test(m)) {
+    if (/合并库|合并模块|mp4-remux|YtM4sMux|YtWebmMux|WebM 合并|未加载/.test(m)) {
       return '请刷新页面后重试';
     }
     if (/bot|机器人|LOGIN_REQUIRED|Sign in|不是机器人/i.test(m)) {
@@ -194,7 +194,9 @@
       s.onerror = () => reject(new Error('加载失败: ' + file));
       (document.documentElement || document.head).appendChild(s);
     });
-    muxReadyPromise = loadScript('mp4-remux.iife.js').then(() => loadScript('m4s-mux.js'));
+    muxReadyPromise = loadScript('mp4-remux.iife.js')
+      .then(() => loadScript('m4s-mux.js'))
+      .then(() => loadScript('webm-mux.js'));
     return muxReadyPromise;
   }
   setupMuxInPage().catch(() => {});
@@ -222,7 +224,7 @@
    * 合并：用 transferable 把 ArrayBuffer 所有权交给 MAIN（零拷贝），
    * 避免几十 MB 结构化克隆把页面卡死 →「进度停住 / 无法合成」。
    */
-  async function mergeBuffersViaPage(videoBuffer, audioBuffer) {
+  async function mergeBuffersViaPage(videoBuffer, audioBuffer, meta) {
     await setupMuxInPage();
     const transfer = [];
     const toBuf = (buf) => {
@@ -250,13 +252,21 @@
     if (aLen < 256) throw new Error('音频数据为空');
     const merged = await agentCall(
       'MERGE_BUFFERS',
-      { videoBuffer: videoBuf, audioBuffer: audioBuf },
+      {
+        videoBuffer: videoBuf,
+        audioBuffer: audioBuf,
+        filename: meta?.filename || null
+      },
       transfer
     );
+    // 合并失败但已分别落盘音视频轨（避免重下几百 MB）
+    if (merged?.savedTracks) {
+      return { savedTracks: true, error: merged.error || '合并失败', videoName: merged.videoName, audioName: merged.audioName };
+    }
     if (!merged?.blob || merged.blob.size < 50 * 1024) {
       throw new Error('合并结果过小');
     }
-    return merged.blob;
+    return { blob: merged.blob, size: merged.size };
   }
 
   function downloadBlob(blob, filename) {
@@ -326,6 +336,7 @@
 
   let downloading = false;
   let downloadPaused = false;
+  let downloadSeq = 0;
   let queueRunning = false;
   let queueCancelled = false;
 
@@ -792,7 +803,7 @@
         selectedQn = qualities[0].qn;
       }
       pillsEl.innerHTML = qualities.map((q) =>
-        `<button type="button" class="yt-dl-pill${q.qn === selectedQn ? ' active' : ''}" data-qn="${q.qn}" title="${q.mode || ''}${q.remuxable === false ? ' · 无 H.264，将自动改用较低清晰度' : ''}">${q.label}${q.mode === 'hls' ? ' HLS' : ''}</button>`
+        `<button type="button" class="yt-dl-pill${q.qn === selectedQn ? ' active' : ''}" data-qn="${q.qn}" title="${q.mode || ''}${q.webm ? ' · WebM+Opus→.webm' : ''}${q.remuxable === false ? ' · 无可合并轨，将自动降档' : ''}">${q.label}${q.mode === 'hls' ? ' HLS' : ''}</button>`
       ).join('');
       pillsEl.querySelectorAll('.yt-dl-pill[data-qn]').forEach((btn) => {
         btn.onclick = () => {
@@ -1031,10 +1042,9 @@
               : '尚无字节';
         debugLog(
           'bg',
-          `${step || 'download'} 进行中… ${ticks * 8}s · ${prog}` +
-            '（断线会 Range 续传；块失败会重试）'
+          `${step || 'download'} 进行中… ${ticks * 20}s · ${prog}`
         );
-      }, 8000);
+      }, 20000);
       let resp;
       try {
         resp = await chrome.runtime.sendMessage({
@@ -1111,8 +1121,8 @@
           const transfer = [];
           if (aResp.buffer instanceof ArrayBuffer) transfer.push(aResp.buffer);
           const mergeHb = setInterval(() => {
-            debugLog('合并', '合成进行中…（大文件可能需数十秒）');
-          }, 5000);
+            debugLog('合并', '合成进行中…');
+          }, 15000);
           let merged;
           try {
             merged = await agentCall(
@@ -1126,9 +1136,23 @@
           } finally {
             clearInterval(mergeHb);
           }
+          if (merged?.savedTracks) {
+            debugLog(
+              '合并',
+              `失败已分轨保存 · ${merged.videoName || ''} + ${merged.audioName || ''} · ${merged.error || ''}`
+            );
+            updateProgress('save', 100);
+            return {
+              savedTracks: true,
+              mergeFailed: true,
+              videoName: merged.videoName,
+              audioName: merged.audioName,
+              filename: result.filename
+            };
+          }
           updateProgress('save', 100);
           debugLog('保存', `合并成品已存 · ${formatBytes(merged?.size || 0)}`);
-          return { merged: true, bytes: merged?.size || 0, via: 'bg-audio' };
+          return { merged: true, bytes: merged?.size || 0, via: 'bg-audio', filename: result.filename };
         } catch (e) {
           console.warn('[YtDL:content] background 音频也失败，仅存视频', e);
           debugLog('音频', 'background 也失败，仅保存视频轨: ' + (e.message || e));
@@ -1169,13 +1193,11 @@
           updateProgress('video', 0);
           debugLog(
             'DASH',
-            `开始 · video候选=${(result.videoUrls || []).length} audio候选=${(result.audioUrls || []).length}` +
-              ` · expectV=${formatBytes(result.videoExpectedBytes || 0)} expectA=${formatBytes(result.audioExpectedBytes || 0)}` +
-              ` · itag=${result.itag || '-'} aitag=${result.audioItag || '-'}`
+            `${result.container || 'dash'} · ${formatBytes(result.videoExpectedBytes || 0)}+${formatBytes(result.audioExpectedBytes || 0)} · ${result.filename || ''}`
           );
           const vResp = await bgFetch(
             result.videoUrls || [],
-            result.videoOnlyFilename || 'video.mp4',
+            result.videoOnlyFilename || result.filename || 'video.mp4',
             'video',
             ua,
             result.itag || null
@@ -1187,20 +1209,12 @@
           }
           const vBytes = assertBgMedia(vResp, 'video', MIN_VIDEO_BYTES, result.videoExpectedBytes || 0);
           const vMagic = peekMagic(vResp.buffer);
-          debugLog(
-            'DASH',
-            `视频 OK · ${formatBytes(vBytes)} · magic=${vMagic} · used=#${vResp.usedIndex ?? '?'}`
-          );
-          // WebM EBML — 合并库不支持
-          if (/^1a 45 df a3/i.test(vMagic)) {
-            throw new Error(
-              '下到了 WebM 视频轨，无法合成有声 MP4。请刷新后重试或改选 1080P/720P'
-            );
-          }
+          const isWebm = /^1a 45 df a3/i.test(vMagic);
+          debugLog('DASH', `视频 OK · ${formatBytes(vBytes)}${isWebm ? ' · WebM' : ''}`);
 
           if (!(result.audioUrls || []).length) {
-            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
-            await downloadBlob(vBlob, result.videoOnlyFilename || result.filename || 'video.mp4');
+            const vBlob = new Blob([vResp.buffer], { type: isWebm ? 'video/webm' : 'video/mp4' });
+            await downloadBlob(vBlob, result.videoOnlyFilename || result.filename || (isWebm ? 'video.webm' : 'video.mp4'));
             updateProgress('save', 100);
             return { videoOnly: true };
           }
@@ -1208,30 +1222,27 @@
           updateProgress('audio', 0);
           let aResp;
           try {
-            aResp = await bgFetch(result.audioUrls, 'audio.m4a', 'audio', ua, result.audioItag || null);
+            aResp = await bgFetch(result.audioUrls, isWebm ? 'audio.webm' : 'audio.m4a', 'audio', ua, result.audioItag || null);
             const aBytes = assertBgMedia(
               aResp,
               'audio',
               MIN_AUDIO_BYTES,
               result.audioExpectedBytes || 0
             );
-            debugLog(
-              'DASH',
-              `音频 OK · ${formatBytes(aBytes)} · magic=${peekMagic(aResp.buffer)} · used=#${aResp.usedIndex ?? '?'}`
-            );
+            debugLog('DASH', `音频 OK · ${formatBytes(aBytes)}`);
           } catch (e) {
             console.warn('[YtDL:content] 音频失败，仅存视频轨', e);
             debugLog('音频', '失败，仅保存无声视频轨: ' + (e.message || e));
-            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
-            await downloadBlob(vBlob, result.videoOnlyFilename || 'video.mp4');
+            const vBlob = new Blob([vResp.buffer], { type: isWebm ? 'video/webm' : 'video/mp4' });
+            await downloadBlob(vBlob, result.videoOnlyFilename || (isWebm ? 'video.webm' : 'video.mp4'));
             updateProgress('save', 100);
             return { videoOnly: true, audioFailed: true };
           }
 
           if (aResp.mode === 'downloads') {
             debugLog('音频', '走 downloads，无法合并；仅存视频轨');
-            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
-            await downloadBlob(vBlob, result.videoOnlyFilename || 'video.mp4');
+            const vBlob = new Blob([vResp.buffer], { type: isWebm ? 'video/webm' : 'video/mp4' });
+            await downloadBlob(vBlob, result.videoOnlyFilename || (isWebm ? 'video.webm' : 'video.mp4'));
             updateProgress('save', 100);
             return { videoOnly: true };
           }
@@ -1240,18 +1251,34 @@
           updateProgress('merge', 5, totalBytes, totalBytes);
           debugLog(
             '合并',
-            `页面合成（零拷贝移交）· 视频 ${formatBytes(vResp.buffer.byteLength)} + 音频 ${formatBytes(aResp.buffer.byteLength)}` +
-              (totalBytes > 80 * 1024 * 1024 ? ' · 较大请耐心等待' : '')
+            `${isWebm ? 'WebM' : 'MP4'} 合成 · ${formatBytes(vResp.buffer.byteLength)}+${formatBytes(aResp.buffer.byteLength)}`
           );
           const mergeHb = setInterval(() => {
-            debugLog('合并', '合成进行中…（大文件可能需数十秒，请勿关闭页面）');
-          }, 5000);
-          let mergedBlob;
+            debugLog('合并', '合成进行中…');
+          }, 15000);
+          let mergeOut;
           try {
-            mergedBlob = await mergeBuffersViaPage(vResp.buffer, aResp.buffer);
+            mergeOut = await mergeBuffersViaPage(vResp.buffer, aResp.buffer, {
+              filename: result.filename
+            });
           } finally {
             clearInterval(mergeHb);
           }
+          if (mergeOut?.savedTracks) {
+            debugLog(
+              '合并',
+              `失败已分轨保存 · ${mergeOut.videoName || ''} + ${mergeOut.audioName || ''} · ${mergeOut.error || ''}`
+            );
+            updateProgress('save', 100);
+            return {
+              savedTracks: true,
+              mergeFailed: true,
+              videoName: mergeOut.videoName,
+              audioName: mergeOut.audioName,
+              filename: result.filename
+            };
+          }
+          const mergedBlob = mergeOut.blob;
           debugLog(
             '合并',
             `完成 · ${formatBytes(mergedBlob.size)} · magic=${peekMagic(await mergedBlob.slice(0, 8).arrayBuffer())}`
@@ -1261,7 +1288,7 @@
           debugLog('保存', `触发浏览器下载 · ${mergedName}`);
           await downloadBlob(mergedBlob, mergedName);
           updateProgress('save', 100);
-          return { merged: true, bytes: mergedBlob.size };
+          return { merged: true, bytes: mergedBlob.size, filename: mergedName };
         }
 
         updateProgress('download', 0);
@@ -1301,15 +1328,26 @@
     }
 
     async function startDownload() {
-      if (!selectedQn || !videoInfo || queueRunning) return;
-      if (!(await ensureMuxReady())) return;
+      if (!selectedQn || !videoInfo || queueRunning || downloading) return;
 
+      // 先占位，避免 ensureMuxReady 等待期间连点开两次
+      downloading = true;
       startBtn.disabled = true;
       queueBtn.disabled = true;
       startBtn.textContent = '下载中…';
       statusEl.classList.add('hidden');
+
+      if (!(await ensureMuxReady())) {
+        downloading = false;
+        startBtn.disabled = false;
+        queueBtn.disabled = false;
+        startBtn.innerHTML = btnDefaultHtml;
+        return;
+      }
+
+      const seq = ++downloadSeq;
       showProgressStart();
-      debugLog('下载', `qn=${selectedQn}`);
+      debugLog('下载', `──── #${seq} 开始 · ${selectedQn}P · ${videoInfo.title || ''} ────`);
 
       try {
         const result = await runSingleDownload(videoInfo);
@@ -1320,6 +1358,11 @@
             result.audioFailed
               ? '视频轨已保存（无声音）。音频失败，可改较低清晰度重试'
               : '已下载视频轨（无音频）'
+          );
+        } else if (result.savedTracks || result.mergeFailed) {
+          showStatus(
+            'success',
+            `合并未成功，已分别保存音视频轨（无需重下）。可用 VLC / ffmpeg 合并：${result.videoName || '视频'} + ${result.audioName || '音频'}`
           );
         } else if (result.via === 'downloads') {
           showStatus('success', '已交给浏览器下载，请查看右上角下载栏');
@@ -1334,10 +1377,13 @@
           showStatus(
             'success',
             result.actualQn && result.requestedQn && result.actualQn !== result.requestedQn
-              ? `下载完成（请求 ${result.requestedQn}P 无 H.264，已存 ${result.actualQn}P）`
-              : '下载完成，已保存为 MP4'
+              ? `下载完成（请求 ${result.requestedQn}P 无匹配档，已存 ${result.actualQn}P）`
+              : /\.webm$/i.test(result.filename || '')
+                ? '下载完成，已保存为 WebM（VP9/Opus）'
+                : '下载完成，已保存为 MP4'
           );
         }
+        debugLog('下载', `──── #${seq} 完成 ────`);
       } catch (err) {
         hideProgress();
         console.error('[YtDL:content] 下载失败', err);
@@ -1348,7 +1394,9 @@
           showErrorWithFaq(msg, errorFaqAnchor(msg));
         }
         debugLog('错误', err.message || String(err));
+        debugLog('下载', `──── #${seq} 失败（需重新点下载才会再拉） ────`);
       } finally {
+        downloading = false;
         startBtn.disabled = false;
         queueBtn.disabled = false;
         startBtn.innerHTML = btnDefaultHtml;

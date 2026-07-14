@@ -394,7 +394,7 @@ function makeProgressTracker(onProgress, total, tabId) {
         lastUi = now;
         onProgress({ received, total, percent });
       }
-      if (total && percent - lastTabPct >= 10) {
+      if (total && percent - lastTabPct >= 25) {
         lastTabPct = percent;
         tabLog(tabId, 'bg', `收流 ${formatBytes(received)}/${formatBytes(total)} · ${percent}%`);
       }
@@ -521,7 +521,7 @@ async function fetchOneSequentialResumable(url, signal, onProgress, userAgent, t
   const pushProgress = () => {
     const percent = total ? Math.min(99, Math.round((received / total) * 100)) : 0;
     onProgress({ received, total, percent });
-    if (total && percent - lastTabPct >= 10) {
+    if (total && percent - lastTabPct >= 25) {
       lastTabPct = percent;
       tabLog(tabId, 'bg', `收流 ${formatBytes(received)}/${formatBytes(total)} · ${percent}%`);
     }
@@ -628,7 +628,7 @@ async function fetchOneParallel(url, signal, onProgress, userAgent, tabId, total
   tabLog(
     tabId,
     'bg',
-    `分块并行 ${segments.length} 段×${formatBytes(CHUNK_SIZE)} · 并发 ${workers} · 总计 ${formatBytes(total)}`
+    `分块并行 ${segments.length} 段 · 并发 ${workers} · ${formatBytes(total)}`
   );
   const t0 = Date.now();
   const tracker = makeProgressTracker(onProgress, total, tabId);
@@ -661,11 +661,15 @@ async function fetchOneParallel(url, signal, onProgress, userAgent, tabId, total
         }
         seg.buf = buf;
         doneCount += 1;
-        if (doneCount === 1 || doneCount === segments.length || doneCount % 5 === 0) {
+        if (
+          doneCount === 1 ||
+          doneCount === segments.length ||
+          doneCount % Math.max(20, Math.floor(segments.length / 4)) === 0
+        ) {
           tabLog(
             tabId,
             'bg',
-            `块进度 ${doneCount}/${segments.length} · w${wid} 完成 #${seg.i} ${formatBytes(buf.byteLength)}`
+            `块进度 ${doneCount}/${segments.length}`
           );
         }
       } catch (e) {
@@ -696,7 +700,7 @@ async function fetchOneParallel(url, signal, onProgress, userAgent, tabId, total
   tabLog(
     tabId,
     'bg',
-    `并行收齐 ${formatBytes(body.byteLength)}/${formatBytes(total)} · ${Date.now() - t0}ms · magic=${peekMagicU8(body)}`
+    `并行收齐 ${formatBytes(body.byteLength)} · ${Date.now() - t0}ms`
   );
   log('fetch OK parallel', formatBytes(body.byteLength) + ' · ' + segments.length + ' chunks');
   return body.buffer;
@@ -799,8 +803,7 @@ async function downloadWithFallback(urls, tabId, filename, sendProgress, userAge
   tabLog(
     tabId,
     'bg',
-    `开始 · 原始 ${(urls || []).length} 条 → 去重 ${list.length} 条 · UA链=${uaChain.length}` +
-      ` · 首UA=${String(uaChain[0] || 'default').slice(0, 40)}`
+    `开始下载 · ${list.length} 候选 · ${formatBytes(getClen(list[0]) || 0) || '?'}`
   );
 
   // 只快速探测前 2 条
@@ -808,11 +811,6 @@ async function downloadWithFallback(urls, tabId, filename, sendProgress, userAge
   for (const u of list.slice(0, 2)) {
     const p = await probeUrl(u, uaChain[0] || null);
     probes.push(p);
-    tabLog(
-      tabId,
-      'probe',
-      `#${probes.length - 1} ${p.ok ? 'OK' : 'FAIL'} status=${p.status || p.error || '?'} sample=${p.sampleBytes || 0}b · ${String(u).slice(0, 120)}`
-    );
   }
 
   const ordered = [];
@@ -829,11 +827,7 @@ async function downloadWithFallback(urls, tabId, filename, sendProgress, userAge
       ordered.push(u);
     }
   });
-  tabLog(
-    tabId,
-    'bg',
-    `候选顺序 ${ordered.length} 条 · clen=[${ordered.map((u) => formatBytes(getClen(u) || 0)).join(', ')}]`
-  );
+  tabLog(tabId, 'bg', `候选 ${ordered.length} 条`);
 
   let lastErr = null;
   for (let i = 0; i < ordered.length; i++) {
@@ -841,17 +835,13 @@ async function downloadWithFallback(urls, tabId, filename, sendProgress, userAge
     for (let ui = 0; ui < uaChain.length; ui++) {
       const ua = uaChain[ui];
       log(`try fetch ${i + 1}/${ordered.length} ua${ui}`, String(url).slice(0, 100));
-      tabLog(
-        tabId,
-        'bg',
-        `尝试候选 ${i + 1}/${ordered.length}` +
-          (uaChain.length > 1 ? ` · UA#${ui}` : '') +
-          ` · clen=${formatBytes(getClen(url) || 0)}`
-      );
+      if (i === 0 && ui === 0) {
+        tabLog(tabId, 'bg', `拉取中 · ${formatBytes(getClen(url) || 0) || '未知大小'}`);
+      }
       try {
         const buffer = await fetchOne(url, ac.signal, sendProgress, ua, tabId);
         activeFetches.delete(tabId);
-        tabLog(tabId, 'bg', `候选 #${i} 成功 · ${formatBytes(buffer.byteLength)}`);
+        tabLog(tabId, 'bg', `完成 · ${formatBytes(buffer.byteLength)}`);
         return { mode: 'buffer', buffer, probes, usedIndex: i };
       } catch (e) {
         if (e.name === 'AbortError' || ac.signal.aborted) {
@@ -860,13 +850,13 @@ async function downloadWithFallback(urls, tabId, filename, sendProgress, userAge
         }
         lastErr = e;
         log('fetch fail', e.message || e);
-        tabLog(tabId, 'bg', `候选 #${i} UA#${ui} 失败: ${e.message || e}`);
+        tabLog(tabId, 'bg', `失败: ${e.message || e}`);
         // 403/忽略 Range 换 UA；纯 network 也允许换 UA 再试同一 URL
         if (/HTTP 403|HTTP 401|忽略 Range/i.test(e.message || '') && ui < uaChain.length - 1) {
           continue;
         }
         if (isResumableErr(e) && ui < uaChain.length - 1) {
-          tabLog(tabId, 'bg', '同 URL 换 UA 再试');
+          tabLog(tabId, 'bg', '换 UA 再试');
           continue;
         }
         break;
@@ -1030,12 +1020,8 @@ function respondWithBuffer(sendResponse, buffer, extra = {}) {
   const transferId = storeTransfer(ab, tabId);
   const chunkSize = TRANSFER_CHUNK;
   const chunks = Math.ceil(size / chunkSize);
-  if (tabId != null) {
-    tabLog(
-      tabId,
-      'bg',
-      `回传 base64 分块 · ${formatBytes(size)} · ${chunks}×${formatBytes(chunkSize)} · id=${transferId}`
-    );
+  if (tabId != null && size > 32 * 1024 * 1024) {
+    tabLog(tabId, 'bg', `回传页面 · ${formatBytes(size)}`);
   }
   log('respond base64-chunked', transferId, formatBytes(size), chunks);
   sendResponse({

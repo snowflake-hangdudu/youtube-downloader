@@ -120,8 +120,9 @@ youtube-downloader/
 ├── popup/
 │   ├── popup.html/js/css
 ├── lib/
-│   ├── mp4-remux.iife.js      # DASH 合并（MIT）
-│   └── m4s-mux.js             # YtM4sMux.mergeM4s
+│   ├── mp4-remux.iife.js      # DASH H.264+AAC 合并（MIT）
+│   ├── m4s-mux.js             # YtM4sMux.mergeM4s
+│   └── webm-mux.js            # YtWebmMux.mergeWebm（VP9+Opus）
 ├── icons/
 ├── assets/icon-source.png
 ├── docs/index.html / faq.html
@@ -301,16 +302,17 @@ fetchSnapshot → RESOLVE_VIDEO → readPlayerResponse()
 ### 6.5 合并与落盘
 
 - DASH：音视频 bg 拉齐后 **只存一份**有声成品（音频失败时才另存无声视频轨）
-- 文件名带清晰度：`标题_1080P.mp4`（以实际合并的轨高度为准）
-- **合并库只支持 H.264(`avc1`) + AAC(`mp4a`)**：
-  - 1440P/2160P 常见是 **WebM(VP9)** 或 **AV1**，扩展名可能仍是 mp4，但合出文件无法播放
-  - 选中非 H.264 时自动改用 ≤ 该高度的最高 `avc1` 档，并在成功提示中说明「请求 xxxP 无 H.264，已存 yyyP」
-  - 视频候选禁止混入 WebM；下载 magic=`1a 45 df a3` 直接拒绝合并
-- 注入 `lib/mp4-remux.iife.js`、`lib/m4s-mux.js`（**外链**，禁内联）  
-- content → page-agent：`MERGE_BUFFERS` 用 **transferable** 移交 ArrayBuffer（零拷贝）  
-- `YtM4sMux.mergeM4s`；禁止依赖 FFmpeg.wasm  
-- 调试：background 经 `YT_DL_BG_LOG`；大文件回传用 **base64 分块**（Edge 直传 ArrayBuffer 会空包）
-- 清晰度胶囊：无 H.264 的高档可能显示为 `1440P↓`（悬停提示会降档）
+- 文件名带清晰度：`标题_1080P.mp4` / `标题_1440P.webm`（以实际轨高度为准）
+- **双通路合并：**
+  1. **MP4**：H.264(`avc1`) + AAC(`mp4a`) → `lib/mp4-remux` + `m4s-mux`
+  2. **WebM**：VP9/AV1 WebM + Opus WebM → `lib/webm-mux.js`（EBML 无损 remux，无 FFmpeg）
+- 选流：同档有 WebM+Opus 时优先真高清（如 1440P）；否则再降到 H.264
+- 胶囊：`1440P·WebM` 表示该档走 WebM；`1440P↓` 表示无直接可合并轨
+- content → page-agent：`MERGE_BUFFERS` 用 **transferable** 移交 ArrayBuffer（零拷贝）
+- 调试：background 经 `YT_DL_BG_LOG`；大文件回传用 **base64 分块**；合并日志含 magic / 通路 / cluster 数
+- 禁止依赖 FFmpeg.wasm（WebM 用自研 EBML remux）
+
+注入库：`lib/mp4-remux.iife.js`、`lib/m4s-mux.js`、`lib/webm-mux.js`（**外链**，禁内联）
 
 ---
 
@@ -456,7 +458,7 @@ python scripts/gen_store_assets.py
 | 合并流 / 清晰度 | `page-agent.js` | `loadFullStreamingData`, `buildQualityList`, `getQualities` |
 | 选流 / 下载入口 | `page-agent.js` | `pickStreamsForQn`, `handleDownload`, `handleHlsDownload` |
 | HLS | `page-agent.js` | `loadHlsBundle`, `mergeHlsIntoQualities` |
-| 合并 | `page-agent.js`, `lib/m4s-mux.js` | `MERGE_BUFFERS`, `mergeM4sInPage` |
+| 合并 | `page-agent.js`, `lib/m4s-mux.js`, `lib/webm-mux.js` | `MERGE_BUFFERS`, `mergeM4sInPage` |
 | 顺序下载 / 进度 | `background.js` | `fetchOne`, `fetchOneParallel`, `fetchByteRange`, `fetchOneSequentialResumable` |
 | 嗅探 | `background.js` | `rememberTabGv`, `YT_DL_GET_SNIFFED` |
 | bg 编排 | `content.js` | `bgFetch`, `bgFetchConcat`, `runSingleDownload` |

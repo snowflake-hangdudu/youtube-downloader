@@ -156,7 +156,7 @@
   function formatDownloadError(err) {
     const msg = err?.message || String(err);
     if (msg === '下载已取消') return msg;
-    if (/合并库|合并模块|mp4-remux|YtM4sMux|未加载/.test(msg)) {
+    if (/合并库|合并模块|mp4-remux|YtM4sMux|YtWebmMux|未加载/.test(msg)) {
       return '请刷新页面后重试';
     }
     if (/bot|机器人|LOGIN_REQUIRED|Sign in|不是机器人/i.test(msg)) {
@@ -1217,18 +1217,23 @@
     } catch (_) {}
 
     const qualities = [...byHeight.values()].sort((a, b) => b.qn - a.qn);
-    // 标注：该高度若无 avc1，点下载会自动降到更低 H.264
+    // 标注：该高度若既无 avc1 也无 webm，点下载可能降档
     const avcHeights = new Set();
+    const webmHeights = new Set();
     for (const f of [...(sd.formats || []), ...(sd.adaptiveFormats || [])]) {
-      if (isVideoFormat(f) && /avc1/i.test(f.mimeType || '')) {
-        const h = formatHeight(f);
-        if (h) avcHeights.add(h);
-      }
+      if (!isVideoFormat(f)) continue;
+      const h = formatHeight(f);
+      if (!h) continue;
+      if (/avc1/i.test(f.mimeType || '')) avcHeights.add(h);
+      if (/webm/i.test(f.mimeType || '')) webmHeights.add(h);
     }
     for (const q of qualities) {
-      q.remuxable = avcHeights.has(q.qn);
+      q.remuxable = avcHeights.has(q.qn) || webmHeights.has(q.qn);
+      q.webm = webmHeights.has(q.qn) && !avcHeights.has(q.qn);
       if (!q.remuxable && q.mode !== 'hls' && q.qn >= 1440) {
         q.label = q.qn + 'P↓';
+      } else if (q.webm && q.mode !== 'hls') {
+        q.label = q.qn + 'P·WebM';
       }
     }
     const hasAudio = (sd.adaptiveFormats || []).some((f) => {
@@ -1753,7 +1758,8 @@
       .sort((a, b) => Math.abs(a - h) - Math.abs(b - h))[0];
     return {
       video: videoMap[nearest] || videoMap[1080],
-      audio: [140, 139, 141, 249, 250, 251]
+      // Opus WebM 优先（249/250/251），再 AAC
+      audio: [251, 250, 249, 140, 139, 141]
     };
   }
 
@@ -2224,31 +2230,51 @@
   async function mergeM4sInPage(videoBlob, audioBlob) {
     if (!videoBlob?.size) throw new Error('视频数据为空');
     if (!audioBlob?.size) throw new Error('音频数据为空');
-    const mux = window.YtM4sMux || window.BiliM4sMux;
-    if (!mux?.mergeM4s) throw new Error('合并库未加载，请刷新页面后重试');
-    if (typeof window.mp4Remux !== 'function') throw new Error('mp4-remux 未加载，请刷新页面后重试');
     const total = videoBlob.size + audioBlob.size;
     if (total > 1.5 * 1024 * 1024 * 1024) throw new Error('文件过大，请改选较低清晰度');
 
-    const head = new Uint8Array(await videoBlob.slice(0, 8).arrayBuffer());
-    // WebM EBML: 1A 45 DF A3
-    if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) {
-      throw new Error('视频轨是 WebM，无法与音频合成 MP4。请改选清晰度重试（应使用 MP4/AVC）');
-    }
+    const vHead = new Uint8Array(await videoBlob.slice(0, 8).arrayBuffer());
+    const aHead = new Uint8Array(await audioBlob.slice(0, 8).arrayBuffer());
+    const vWebm = vHead[0] === 0x1a && vHead[1] === 0x45 && vHead[2] === 0xdf && vHead[3] === 0xa3;
+    const aWebm = aHead[0] === 0x1a && aHead[1] === 0x45 && aHead[2] === 0xdf && aHead[3] === 0xa3;
+
     log(
       '合并',
-      `开始 · 视频 ${(videoBlob.size / 1024 / 1024).toFixed(1)}MB + 音频 ${(audioBlob.size / 1024 / 1024).toFixed(1)}MB` +
-        (total > 80 * 1024 * 1024 ? ' · 较大，可能需数十秒请勿关闭' : '')
+      `${vWebm ? 'WebM' : 'MP4'} · ${(videoBlob.size / 1024 / 1024).toFixed(1)}MB+${(audioBlob.size / 1024 / 1024).toFixed(1)}MB`
     );
     sendProgress('merge', 0, { total });
     await new Promise((r) => setTimeout(r, 40));
     const t0 = Date.now();
+
+    if (vWebm) {
+      if (!aWebm) {
+        throw new Error(
+          '视频是 WebM，但音频不是 WebM/Opus（多为 AAC）。无法合成；请重试或改选 H.264 清晰度'
+        );
+      }
+      const webmMux = window.YtWebmMux;
+      if (!webmMux?.mergeWebm) throw new Error('WebM 合并库未加载，请刷新页面后重试');
+      log('合并', 'WebM remux…');
+      const blob = await webmMux.mergeWebm(
+        await videoBlob.arrayBuffer(),
+        await audioBlob.arrayBuffer(),
+        { log }
+      );
+      log('合并', `WebM 完成 · ${(blob.size / 1024 / 1024).toFixed(1)}MB · ${Date.now() - t0}ms`);
+      sendProgress('merge', 100, { total: blob.size });
+      return blob;
+    }
+
+    const mux = window.YtM4sMux || window.BiliM4sMux;
+    if (!mux?.mergeM4s) throw new Error('合并库未加载，请刷新页面后重试');
+    if (typeof window.mp4Remux !== 'function') throw new Error('mp4-remux 未加载，请刷新页面后重试');
+    log('合并', 'MP4 remux…');
     const blob = await mux.mergeM4s(
       await videoBlob.arrayBuffer(),
       await audioBlob.arrayBuffer(),
       window.mp4Remux
     );
-    log('合并', `完成 · ${(blob.size / 1024 / 1024).toFixed(1)}MB · ${Date.now() - t0}ms`);
+    log('合并', `MP4 完成 · ${(blob.size / 1024 / 1024).toFixed(1)}MB · ${Date.now() - t0}ms`);
     sendProgress('merge', 100, { total });
     return blob;
   }
@@ -2265,14 +2291,24 @@
     return base + qtag + (suffix || '') + (ext || '.mp4');
   }
 
-  /** 合并库只认 H.264/AVC（avc1）；AV1/WebM/VP9 合出来常无法播放 */
+  /** MP4 合并：H.264(avc1)+AAC；WebM 合并：VP9/AV1 WebM + Opus WebM */
   function isAvc1Video(f) {
     return /avc1/i.test(f?.mimeType || '');
+  }
+
+  function isWebmVideo(f) {
+    const m = f?.mimeType || '';
+    return /webm/i.test(m) && /vp9|vp09|av01|video\//i.test(m);
   }
 
   function isMp4aAudio(f) {
     const m = f?.mimeType || '';
     return /mp4a|audio\/mp4/i.test(m) && !/webm|opus/i.test(m);
+  }
+
+  function isOpusWebmAudio(f) {
+    const m = f?.mimeType || '';
+    return /opus/i.test(m) || (/audio\/webm/i.test(m) && !/mp4a/i.test(m));
   }
 
   function briefMime(f) {
@@ -2301,6 +2337,24 @@
     return all.sort(scored)[0];
   }
 
+  /** 找目标高度附近的 WebM 视频（可与 Opus 合成 .webm） */
+  function findWebmVideo(sd, preferHeight, opts) {
+    const h = Number(preferHeight) || 0;
+    const all = [...(sd.adaptiveFormats || [])]
+      .filter((f) => isVideoFormat(f) && !hasDrm(f))
+      .map(hydrateFormatUrl)
+      .filter((f) => isWebmVideo(f) && (canAccess(f) || sniffGoogleVideoUrls(f.itag).length));
+    if (!all.length) return null;
+    const exact = all.filter((f) => formatHeight(f) === h);
+    const pool = exact.length ? exact : all;
+    return pool.sort((a, b) => {
+      const da = Math.abs(formatHeight(a) - h);
+      const db = Math.abs(formatHeight(b) - h);
+      if (da !== db) return da - db;
+      return formatDownloadScore(b, opts) - formatDownloadScore(a, opts);
+    })[0];
+  }
+
   function pickRemuxableAudio(sd, preferClient, opts) {
     const list = (sd.adaptiveFormats || [])
       .filter((f) => {
@@ -2315,6 +2369,23 @@
         return formatDownloadScore(b, opts) - formatDownloadScore(a, opts);
       });
     return list[0] || pickBestAudio(sd.adaptiveFormats, opts);
+  }
+
+  function pickOpusAudio(sd, preferClient, opts) {
+    const list = (sd.adaptiveFormats || [])
+      .filter((f) => {
+        if (!isAudioFormat(f) || hasDrm(f) || !isOpusWebmAudio(f)) return false;
+        hydrateFormatUrl(f);
+        return canAccess(f) || sniffGoogleVideoUrls(f.itag).length;
+      })
+      .sort((a, b) => {
+        const ca = (a._fromClient || '') === preferClient ? 1 : 0;
+        const cb = (b._fromClient || '') === preferClient ? 1 : 0;
+        if (ca !== cb) return cb - ca;
+        return (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0);
+      });
+    if (list[0]) return list[0];
+    return null;
   }
 
   async function handleDownload(aid, cid, qn, title, preferred) {
@@ -2375,43 +2446,77 @@
         `${picked.type} qn=${requestQn} itag=${picked.video?.itag} client=${picked.video?._fromClient || '?'} · ${briefMime(picked.video)}`
       );
 
-      // 合并库只认 H.264+AAC。1440P 常见 WebM/AV1，硬合会无法播放 → 尽早改用可 remux 档
-      if (picked.type !== 'durl' && !isAvc1Video(picked.video)) {
-        const remuxable = findRemuxableVideo(sd, requestQn, opts);
-        if (remuxable) {
-          const fromH = formatHeight(picked.video) || requestQn;
-          const fromMime = briefMime(picked.video);
-          const toH = formatHeight(remuxable);
-          const audio = pickRemuxableAudio(sd, remuxable._fromClient, opts);
-          hydrateFormatUrl(remuxable);
-          const hasAccess = canAccess(remuxable) || sniffGoogleVideoUrls(remuxable.itag).length > 0;
-          picked = {
-            type: hasAccess && canAccess(remuxable) ? 'dash' : 'sniff',
-            video: remuxable,
-            audio,
-            pool: [remuxable, ...(picked.pool || []).filter((f) => isAvc1Video(f))]
-          };
-          if (toH !== fromH) {
+      // 选轨策略：
+      // 1) 已是 WebM + 有 Opus → 走 WebM remux（真 1440P）
+      // 2) 非 avc1 且能配对 Opus 的同档 WebM → 改用 WebM
+      // 3) 否则降到 H.264 + AAC → MP4
+      let containerMode = 'mp4'; // 'mp4' | 'webm'
+      if (picked.type !== 'durl') {
+        const opus = pickOpusAudio(sd, picked.video?._fromClient, opts);
+        if (isWebmVideo(picked.video) && opus) {
+          containerMode = 'webm';
+          picked.audio = opus;
+          log('下载', `WebM 通路 · itag=${picked.video.itag} + Opus ${opus.itag} · ${briefMime(picked.video)}`);
+        } else if (!isAvc1Video(picked.video)) {
+          const webmHit = findWebmVideo(sd, requestQn, opts);
+          const opus2 = opus || pickOpusAudio(sd, webmHit?._fromClient, opts);
+          if (webmHit && opus2 && formatHeight(webmHit) === requestQn) {
+            containerMode = 'webm';
+            hydrateFormatUrl(webmHit);
+            const hasAccess = canAccess(webmHit) || sniffGoogleVideoUrls(webmHit.itag).length > 0;
+            picked = {
+              type: hasAccess && canAccess(webmHit) ? 'dash' : 'sniff',
+              video: webmHit,
+              audio: opus2,
+              pool: [webmHit]
+            };
             log(
               '下载',
-              `⚠ ${fromH}P 非 H.264（${fromMime}），已自动改用 ${toH}P H.264 itag=${remuxable.itag}`
+              `改用 WebM · ${formatHeight(webmHit)}P itag=${webmHit.itag} + Opus ${opus2.itag} · ${briefMime(webmHit)}`
             );
           } else {
-            log('下载', `改用 H.264 itag=${remuxable.itag} · ${briefMime(remuxable)}`);
+            const remuxable = findRemuxableVideo(sd, requestQn, opts);
+            if (remuxable) {
+              const fromH = formatHeight(picked.video) || requestQn;
+              const fromMime = briefMime(picked.video);
+              const toH = formatHeight(remuxable);
+              const audio = pickRemuxableAudio(sd, remuxable._fromClient, opts);
+              hydrateFormatUrl(remuxable);
+              const hasAccess = canAccess(remuxable) || sniffGoogleVideoUrls(remuxable.itag).length > 0;
+              containerMode = 'mp4';
+              picked = {
+                type: hasAccess && canAccess(remuxable) ? 'dash' : 'sniff',
+                video: remuxable,
+                audio,
+                pool: [remuxable, ...(picked.pool || []).filter((f) => isAvc1Video(f))]
+              };
+              if (toH !== fromH) {
+                log(
+                  '下载',
+                  `⚠ ${fromH}P 非 H.264（${fromMime}），无可用 WebM+Opus，已改用 ${toH}P H.264 itag=${remuxable.itag}`
+                );
+              } else {
+                log('下载', `改用 H.264 itag=${remuxable.itag} · ${briefMime(remuxable)}`);
+              }
+            } else {
+              log('下载', `⚠ ${requestQn}P 既无 WebM+Opus 也无 H.264，仍按原轨尝试`);
+            }
           }
-        } else if (picked.type === 'dash' || picked.type === 'sniff') {
-          log('下载', `⚠ ${requestQn}P 无可用 H.264，仍按原轨尝试（合并可能失败）`);
+        } else {
+          picked.audio = pickRemuxableAudio(sd, picked.video?._fromClient, opts) || picked.audio;
         }
       }
+      log('下载', `容器模式=${containerMode}`);
 
       sendProgress('prepare', 20);
       const actualQnEarly = formatHeight(picked.video) || requestQn;
+      const earlyExt = containerMode === 'webm' ? '.webm' : '.mp4';
 
       // SABR / 无直链：完全依赖播放器捕获
       if (picked.type === 'sniff') {
         const sniffPack = collectSniffUrlsForHeight(actualQnEarly || 360);
-        const fname = buildOutName(title, actualQnEarly || 360, '', '.mp4');
-        const vonly = buildOutName(title, actualQnEarly || 360, '_video', '.mp4');
+        const fname = buildOutName(title, actualQnEarly || 360, '', earlyExt);
+        const vonly = buildOutName(title, actualQnEarly || 360, '_video', earlyExt);
         log(
           '下载',
           `嗅探模式 video=${sniffPack.videoUrls.length} audio=${sniffPack.audioUrls.length} vitag=${sniffPack.videoItag} aitag=${sniffPack.audioItag}`
@@ -2506,39 +2611,56 @@
         };
       }
 
-      // DASH：此时应已是 avc1；若仍不是则无法安全合并
+      // DASH：mp4=H.264+AAC；webm=VP9+Opus
       let video = picked.video;
-      let audio = pickRemuxableAudio(sd, video?._fromClient, opts) || picked.audio;
-      log('下载', `DASH · itag=${video?.itag} · ${briefMime(video)}`);
-      if (!isAvc1Video(video)) {
-        throw new Error(
-          `${requestQn}P 无 H.264/MP4 直链（多为 WebM/AV1）。请改选 1080P/720P 等，或刷新后重试`
-        );
+      let audio = picked.audio;
+      const useWebm = containerMode === 'webm' || isWebmVideo(video);
+      if (useWebm) {
+        audio = pickOpusAudio(sd, video?._fromClient, opts) || audio;
+        if (!audio || !isOpusWebmAudio(audio)) {
+          throw new Error(
+            `${requestQn}P WebM 视频缺少 Opus 音频轨，无法合成 .webm。请改选 H.264 清晰度或刷新重试`
+          );
+        }
+        log('下载', `DASH/WebM · video itag=${video?.itag} · audio itag=${audio?.itag} · ${briefMime(video)}`);
+      } else {
+        audio = pickRemuxableAudio(sd, video?._fromClient, opts) || audio;
+        log('下载', `DASH/MP4 · itag=${video?.itag} · ${briefMime(video)}`);
+        if (!isAvc1Video(video)) {
+          throw new Error(
+            `${requestQn}P 无 H.264/MP4 直链（多为 WebM/AV1）。请改选 1080P/720P 等，或刷新后重试`
+          );
+        }
       }
 
       const actualQn = formatHeight(video) || requestQn;
-      const fname = buildOutName(title, actualQn, '', '.mp4');
-      const vonly = buildOutName(title, actualQn, '_video', '.mp4');
+      const outExt = useWebm ? '.webm' : '.mp4';
+      const fname = buildOutName(title, actualQn, '', outExt);
+      const vonly = buildOutName(title, actualQn, '_video', outExt);
 
-      // 只下选定的 H.264 轨（同高度其它 avc1 作备选）
       let videoUrls = uniqUrls(collectDownloadCandidates(video));
-      const avcSiblings = (picked.pool || [])
+      const siblings = (picked.pool || [])
         .filter(
           (f) =>
             f &&
             f.itag !== video.itag &&
             formatHeight(f) === formatHeight(video) &&
-            isAvc1Video(f)
+            (useWebm ? isWebmVideo(f) : isAvc1Video(f))
         )
         .slice(0, 2);
-      for (const f of avcSiblings) {
+      for (const f of siblings) {
         for (const u of collectDownloadCandidates(f)) videoUrls.push(u);
       }
       videoUrls = uniqUrls(videoUrls);
       let audioUrls = audio ? collectDownloadCandidates(audio) : [];
       if (audio) {
         const audioAlts = (sd.adaptiveFormats || [])
-          .filter((f) => isAudioFormat(f) && !hasDrm(f) && isMp4aAudio(f))
+          .filter(
+            (f) =>
+              isAudioFormat(f) &&
+              !hasDrm(f) &&
+              (useWebm ? isOpusWebmAudio(f) : isMp4aAudio(f))
+          )
           .map(hydrateFormatUrl)
           .filter((f) => canAccess(f) || sniffGoogleVideoUrls(f.itag).length)
           .sort((a, b) => formatDownloadScore(b, opts) - formatDownloadScore(a, opts))
@@ -2591,7 +2713,8 @@
           videoExpectedBytes: expectedBytesFromFormat(video),
           audioExpectedBytes: expectedBytesFromFormat(audio),
           actualQn,
-          requestedQn: requestQn
+          requestedQn: requestQn,
+          container: useWebm ? 'webm' : 'mp4'
         };
       }
 
@@ -2626,7 +2749,8 @@
               videoBytes: vBlob.size,
               audioExpectedBytes: expectedBytesFromFormat(audio),
               actualQn,
-              requestedQn: requestQn
+              requestedQn: requestQn,
+              container: useWebm ? 'webm' : 'mp4'
             };
           }
           sendProgress('save', 100);
@@ -2651,7 +2775,8 @@
         videoExpectedBytes: expectedBytesFromFormat(video),
         audioExpectedBytes: expectedBytesFromFormat(audio),
         actualQn,
-        requestedQn: requestQn
+        requestedQn: requestQn,
+        container: useWebm ? 'webm' : 'mp4'
       };
     } finally {
       // bgFetch 时真正下载在 content/background，这里只重置准备态
@@ -2693,34 +2818,93 @@
         case 'MERGE_BUFFERS': {
           const vBytes = e.data.videoBuffer?.byteLength || 0;
           const aBytes = e.data.audioBuffer?.byteLength || 0;
-          log('合并', `开始 · 视频 ${(vBytes / 1024 / 1024).toFixed(1)}MB + 音频 ${(aBytes / 1024 / 1024).toFixed(1)}MB`);
           sendProgress('merge', 5, { total: vBytes + aBytes, received: vBytes + aBytes });
-          // 让 UI 先画出「正在合成」再跑 CPU
           await new Promise((r) => setTimeout(r, 30));
-          const vBlob = new Blob([e.data.videoBuffer], { type: 'video/mp4' });
-          const aBlob = new Blob([e.data.audioBuffer], { type: 'audio/mp4' });
-          const merged = await mergeM4sInPage(vBlob, aBlob);
-          sendProgress('merge', 100, { total: merged.size, received: merged.size });
-          log('合并', `完成 · ${(merged.size / 1024 / 1024).toFixed(1)}MB`);
-          reply(id, { type: 'OK', data: { blob: merged, size: merged.size } });
+
+          const vHead = new Uint8Array(e.data.videoBuffer || [], 0, Math.min(4, vBytes));
+          const aHead = new Uint8Array(e.data.audioBuffer || [], 0, Math.min(4, aBytes));
+          const vWebm = vHead[0] === 0x1a && vHead[1] === 0x45 && vHead[2] === 0xdf && vHead[3] === 0xa3;
+          const aWebm = aHead[0] === 0x1a && aHead[1] === 0x45 && aHead[2] === 0xdf && aHead[3] === 0xa3;
+          const base = String(e.data.filename || 'youtube').replace(/\.(mp4|webm|m4a|mkv)$/i, '');
+          const vName = base + '_video' + (vWebm ? '.webm' : '.mp4');
+          const aName = base + '_audio' + (aWebm ? '.webm' : '.m4a');
+
+          try {
+            const vBlob = new Blob([e.data.videoBuffer], { type: vWebm ? 'video/webm' : 'video/mp4' });
+            const aBlob = new Blob([e.data.audioBuffer], { type: aWebm ? 'audio/webm' : 'audio/mp4' });
+            const merged = await mergeM4sInPage(vBlob, aBlob);
+            sendProgress('merge', 100, { total: merged.size, received: merged.size });
+            reply(id, { type: 'OK', data: { blob: merged, size: merged.size } });
+          } catch (mergeErr) {
+            // 音视频已到手：分别落盘，避免用户重下几百 MB
+            log('合并', '失败 → 分别保存音视频轨（无需重下）: ' + (mergeErr?.message || mergeErr));
+            try {
+              saveBlob(new Blob([e.data.videoBuffer], { type: vWebm ? 'video/webm' : 'video/mp4' }), vName);
+              saveBlob(new Blob([e.data.audioBuffer], { type: aWebm ? 'audio/webm' : 'audio/mp4' }), aName);
+              log('合并', `已保存 ${vName} + ${aName}`);
+              sendProgress('save', 100);
+              reply(id, {
+                type: 'OK',
+                data: {
+                  savedTracks: true,
+                  error: String(mergeErr?.message || mergeErr),
+                  videoName: vName,
+                  audioName: aName
+                }
+              });
+            } catch (saveErr) {
+              throw new Error(
+                (mergeErr?.message || '合并失败') + '；分轨保存也失败: ' + (saveErr?.message || saveErr)
+              );
+            }
+          }
           break;
         }
         case 'MERGE_PENDING_VIDEO': {
           const pending = window.__YT_DL_PENDING_VIDEO__;
           if (!pending?.blob?.size) throw new Error('没有缓存的视频轨（可能已过期）');
           sendProgress('merge', 5);
-          log(
-            '合并',
-            `待合并视频 ${ (pending.blob.size / 1024 / 1024).toFixed(2)}MB + 音频 ${((e.data.audioBuffer?.byteLength || 0) / 1024 / 1024).toFixed(2)}MB`
-          );
-          const aBlob = new Blob([e.data.audioBuffer], { type: 'audio/mp4' });
-          const merged = await mergeM4sInPage(pending.blob, aBlob);
-          sendProgress('save', 100);
           const outName = e.data.filename || pending.filename || 'youtube.mp4';
-          saveBlob(merged, outName);
-          window.__YT_DL_PENDING_VIDEO__ = null;
-          log('下载', `待合并视频 + background 音频 完成 → ${outName} · ${(merged.size / 1024 / 1024).toFixed(2)}MB`);
-          reply(id, { type: 'OK', data: { merged: true, size: merged.size, filename: outName } });
+          const base = String(outName).replace(/\.(mp4|webm|m4a|mkv)$/i, '');
+          try {
+            log(
+              '合并',
+              `待合并视频 ${ (pending.blob.size / 1024 / 1024).toFixed(2)}MB + 音频 ${((e.data.audioBuffer?.byteLength || 0) / 1024 / 1024).toFixed(2)}MB`
+            );
+            const aBlob = new Blob([e.data.audioBuffer], { type: 'audio/mp4' });
+            const merged = await mergeM4sInPage(pending.blob, aBlob);
+            sendProgress('save', 100);
+            saveBlob(merged, outName);
+            window.__YT_DL_PENDING_VIDEO__ = null;
+            log('下载', `待合并视频 + background 音频 完成 → ${outName} · ${(merged.size / 1024 / 1024).toFixed(2)}MB`);
+            reply(id, { type: 'OK', data: { merged: true, size: merged.size, filename: outName } });
+          } catch (mergeErr) {
+            log('合并', '失败 → 分别保存（无需重下）: ' + (mergeErr?.message || mergeErr));
+            const vOnly = pending.videoOnlyFilename || base + '_video.mp4';
+            const aName = base + '_audio.m4a';
+            try {
+              saveBlob(pending.blob, vOnly);
+              if (e.data.audioBuffer?.byteLength) {
+                saveBlob(new Blob([e.data.audioBuffer], { type: 'audio/mp4' }), aName);
+              }
+              window.__YT_DL_PENDING_VIDEO__ = null;
+              sendProgress('save', 100);
+              reply(id, {
+                type: 'OK',
+                data: {
+                  savedTracks: true,
+                  error: String(mergeErr?.message || mergeErr),
+                  videoName: vOnly,
+                  audioName: aName,
+                  size: pending.blob.size
+                }
+              });
+            } catch (saveErr) {
+              throw new Error(
+                (mergeErr?.message || '合并失败') + '；分轨保存也失败: ' + (saveErr?.message || saveErr)
+              );
+            }
+          }
           break;
         }
         case 'SAVE_PENDING_VIDEO': {
