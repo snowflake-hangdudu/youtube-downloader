@@ -164,8 +164,7 @@ function expandUrls(urls) {
     seen.add(key);
     out.push(u);
   }
-  // 同一次下载优先大体量（主 itag），避免先成再切到更小的备用 itag
-  out.sort((a, b) => (getClen(b) || 0) - (getClen(a) || 0));
+  // 同高度只保留顺序；勿按 clen 倒序（会把更大的 WebM 排到 MP4 前面）
   return out;
 }
 

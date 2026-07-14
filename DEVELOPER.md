@@ -300,11 +300,17 @@ fetchSnapshot → RESOLVE_VIDEO → readPlayerResponse()
 
 ### 6.5 合并与落盘
 
-- DASH：视频 bg 完成后**先** `<a download>` 存无声视频轨；音频成功合并后再存一份有声成品（共 2 文件）
+- DASH：音视频 bg 拉齐后 **只存一份**有声成品（音频失败时才另存无声视频轨）
+- 文件名带清晰度：`标题_1080P.mp4`（以实际合并的轨高度为准）
+- **合并库只支持 H.264(`avc1`) + AAC(`mp4a`)**：
+  - 1440P/2160P 常见是 **WebM(VP9)** 或 **AV1**，扩展名可能仍是 mp4，但合出文件无法播放
+  - 选中非 H.264 时自动改用 ≤ 该高度的最高 `avc1` 档，并在成功提示中说明「请求 xxxP 无 H.264，已存 yyyP」
+  - 视频候选禁止混入 WebM；下载 magic=`1a 45 df a3` 直接拒绝合并
 - 注入 `lib/mp4-remux.iife.js`、`lib/m4s-mux.js`（**外链**，禁内联）  
-- content → page-agent：`MERGE_BUFFERS` 用 **transferable** 移交 ArrayBuffer（零拷贝），避免大文件 structured clone 卡死  
+- content → page-agent：`MERGE_BUFFERS` 用 **transferable** 移交 ArrayBuffer（零拷贝）  
 - `YtM4sMux.mergeM4s`；禁止依赖 FFmpeg.wasm  
-- 调试：background 经 `YT_DL_BG_LOG` 刷面板；调试区上限约 800 行 
+- 调试：background 经 `YT_DL_BG_LOG`；大文件回传用 **base64 分块**（Edge 直传 ArrayBuffer 会空包）
+- 清晰度胶囊：无 H.264 的高档可能显示为 `1440P↓`（悬停提示会降档）
 
 ---
 

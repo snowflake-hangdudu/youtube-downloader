@@ -792,7 +792,7 @@
         selectedQn = qualities[0].qn;
       }
       pillsEl.innerHTML = qualities.map((q) =>
-        `<button type="button" class="yt-dl-pill${q.qn === selectedQn ? ' active' : ''}" data-qn="${q.qn}" title="${q.mode || ''}">${q.label}${q.mode === 'hls' ? ' HLS' : ''}</button>`
+        `<button type="button" class="yt-dl-pill${q.qn === selectedQn ? ' active' : ''}" data-qn="${q.qn}" title="${q.mode || ''}${q.remuxable === false ? ' · 无 H.264，将自动改用较低清晰度' : ''}">${q.label}${q.mode === 'hls' ? ' HLS' : ''}</button>`
       ).join('');
       pillsEl.querySelectorAll('.yt-dl-pill[data-qn]').forEach((btn) => {
         btn.onclick = () => {
@@ -1090,19 +1090,10 @@
         const ua = result.userAgent || null;
         debugLog(
           '音频',
-          `视频已就绪 ${formatBytes(result.videoBytes)}，先落盘视频轨，再 background 拉音频`
+          `视频已就绪 ${formatBytes(result.videoBytes)}，改 background 拉音频后合并`
         );
         updateProgress('audio', 0);
-        let videoSavedEarly = false;
         try {
-          debugLog('保存', `① 视频轨先存浏览器 · ${result.videoOnlyFilename || 'video.mp4'}`);
-          await agentCall('SAVE_PENDING_VIDEO', {
-            filename: result.videoOnlyFilename || 'video.mp4',
-            keep: true
-          });
-          videoSavedEarly = true;
-          debugLog('保存', '① 已触发；继续拉音频');
-
           const aResp = await bgFetch(
             result.audioUrls || [],
             'audio.m4a',
@@ -1119,38 +1110,38 @@
           await setupMuxInPage();
           const transfer = [];
           if (aResp.buffer instanceof ArrayBuffer) transfer.push(aResp.buffer);
-          debugLog('合并', 'MERGE_PENDING_VIDEO（页面会再存成品）');
-          const merged = await agentCall(
-            'MERGE_PENDING_VIDEO',
-            {
-              audioBuffer: aResp.buffer,
-              filename: result.filename || 'youtube.mp4'
-            },
-            transfer
-          );
-          updateProgress('save', 100);
-          debugLog('保存', `② 合并成品已存 · ${formatBytes(merged?.size || 0)}`);
-          return { merged: true, bytes: merged?.size || 0, via: 'bg-audio', videoSavedEarly: true };
-        } catch (e) {
-          console.warn('[YtDL:content] background 音频也失败，仅存视频', e);
-          debugLog('音频', 'background 也失败: ' + (e.message || e));
-          if (!videoSavedEarly) {
-            try {
-              await agentCall('SAVE_PENDING_VIDEO', {
-                filename: result.videoOnlyFilename || 'video.mp4',
-                keep: false
-              });
-            } catch (e2) {
-              throw new Error('音频失败且保存视频轨失败: ' + (e2.message || e2));
-            }
-          } else {
-            debugLog('保存', '视频轨已先落盘，跳过重复保存');
-            try {
-              await agentCall('SAVE_PENDING_VIDEO', { clearOnly: true });
-            } catch (_) {}
+          const mergeHb = setInterval(() => {
+            debugLog('合并', '合成进行中…（大文件可能需数十秒）');
+          }, 5000);
+          let merged;
+          try {
+            merged = await agentCall(
+              'MERGE_PENDING_VIDEO',
+              {
+                audioBuffer: aResp.buffer,
+                filename: result.filename || 'youtube.mp4'
+              },
+              transfer
+            );
+          } finally {
+            clearInterval(mergeHb);
           }
           updateProgress('save', 100);
-          return { videoOnly: true, audioFailed: true, videoSavedEarly };
+          debugLog('保存', `合并成品已存 · ${formatBytes(merged?.size || 0)}`);
+          return { merged: true, bytes: merged?.size || 0, via: 'bg-audio' };
+        } catch (e) {
+          console.warn('[YtDL:content] background 音频也失败，仅存视频', e);
+          debugLog('音频', 'background 也失败，仅保存视频轨: ' + (e.message || e));
+          try {
+            await agentCall('SAVE_PENDING_VIDEO', {
+              filename: result.videoOnlyFilename || 'video.mp4',
+              keep: false
+            });
+          } catch (e2) {
+            throw new Error('音频失败且保存视频轨失败: ' + (e2.message || e2));
+          }
+          updateProgress('save', 100);
+          return { videoOnly: true, audioFailed: true };
         }
       }
 
@@ -1195,22 +1186,23 @@
             return { via: 'downloads', downloadId: vResp.downloadId };
           }
           const vBytes = assertBgMedia(vResp, 'video', MIN_VIDEO_BYTES, result.videoExpectedBytes || 0);
+          const vMagic = peekMagic(vResp.buffer);
           debugLog(
             'DASH',
-            `视频 OK · ${formatBytes(vBytes)} · magic=${peekMagic(vResp.buffer)} · used=#${vResp.usedIndex ?? '?'}`
+            `视频 OK · ${formatBytes(vBytes)} · magic=${vMagic} · used=#${vResp.usedIndex ?? '?'}`
           );
-
-          const videoOnlyName = result.videoOnlyFilename || 'video.mp4';
-          // 视频先落盘；合并成功后再存一份有声成品（便于断在音频/合并时仍有文件）
-          const vBlobEarly = new Blob([vResp.buffer], { type: 'video/mp4' });
-          debugLog('保存', `① 视频轨先存浏览器 · ${videoOnlyName}`);
-          await downloadBlob(vBlobEarly, videoOnlyName);
-          const videoSavedEarly = true;
-          debugLog('保存', '① 已触发；继续拉音频（合并后会再存成品）');
+          // WebM EBML — 合并库不支持
+          if (/^1a 45 df a3/i.test(vMagic)) {
+            throw new Error(
+              '下到了 WebM 视频轨，无法合成有声 MP4。请刷新后重试或改选 1080P/720P'
+            );
+          }
 
           if (!(result.audioUrls || []).length) {
+            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
+            await downloadBlob(vBlob, result.videoOnlyFilename || result.filename || 'video.mp4');
             updateProgress('save', 100);
-            return { videoOnly: true, videoSavedEarly };
+            return { videoOnly: true };
           }
 
           updateProgress('audio', 0);
@@ -1229,36 +1221,47 @@
             );
           } catch (e) {
             console.warn('[YtDL:content] 音频失败，仅存视频轨', e);
-            debugLog('音频', '失败（视频轨已先落盘，跳过重复保存）: ' + (e.message || e));
+            debugLog('音频', '失败，仅保存无声视频轨: ' + (e.message || e));
+            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
+            await downloadBlob(vBlob, result.videoOnlyFilename || 'video.mp4');
             updateProgress('save', 100);
-            return { videoOnly: true, videoSavedEarly, audioFailed: true };
+            return { videoOnly: true, audioFailed: true };
           }
 
           if (aResp.mode === 'downloads') {
-            debugLog('音频', '走 downloads，无法合并；视频轨已先落盘');
+            debugLog('音频', '走 downloads，无法合并；仅存视频轨');
+            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
+            await downloadBlob(vBlob, result.videoOnlyFilename || 'video.mp4');
             updateProgress('save', 100);
-            return { videoOnly: true, videoSavedEarly };
+            return { videoOnly: true };
           }
 
           const totalBytes = vResp.buffer.byteLength + aResp.buffer.byteLength;
           updateProgress('merge', 5, totalBytes, totalBytes);
           debugLog(
             '合并',
-            `页面合成（零拷贝移交）· 视频 ${formatBytes(vResp.buffer.byteLength)} + 音频 ${formatBytes(aResp.buffer.byteLength)}`
+            `页面合成（零拷贝移交）· 视频 ${formatBytes(vResp.buffer.byteLength)} + 音频 ${formatBytes(aResp.buffer.byteLength)}` +
+              (totalBytes > 80 * 1024 * 1024 ? ' · 较大请耐心等待' : '')
           );
-          const tMerge = Date.now();
-          const mergedBlob = await mergeBuffersViaPage(vResp.buffer, aResp.buffer);
+          const mergeHb = setInterval(() => {
+            debugLog('合并', '合成进行中…（大文件可能需数十秒，请勿关闭页面）');
+          }, 5000);
+          let mergedBlob;
+          try {
+            mergedBlob = await mergeBuffersViaPage(vResp.buffer, aResp.buffer);
+          } finally {
+            clearInterval(mergeHb);
+          }
           debugLog(
             '合并',
-            `完成 · ${formatBytes(mergedBlob.size)} · ${Date.now() - tMerge}ms · magic=${peekMagic(await mergedBlob.slice(0, 8).arrayBuffer())}`
+            `完成 · ${formatBytes(mergedBlob.size)} · magic=${peekMagic(await mergedBlob.slice(0, 8).arrayBuffer())}`
           );
           updateProgress('save', 95);
           const mergedName = result.filename || 'youtube.mp4';
-          debugLog('保存', `② 合并成品再存一份 · ${mergedName}`);
+          debugLog('保存', `触发浏览器下载 · ${mergedName}`);
           await downloadBlob(mergedBlob, mergedName);
           updateProgress('save', 100);
-          debugLog('保存', '② 已触发 · 共 2 个文件（无声视频轨 + 有声 MP4）');
-          return { merged: true, bytes: mergedBlob.size, videoSavedEarly: true };
+          return { merged: true, bytes: mergedBlob.size };
         }
 
         updateProgress('download', 0);
@@ -1327,10 +1330,13 @@
               ? 'HLS 下载完成（.ts，可用 VLC 播放）'
               : 'HLS 下载完成，已保存'
           );
-        } else if (result.videoSavedEarly && result.merged) {
-          showStatus('success', '完成：已先存视频轨，再存合并 MP4（共 2 个文件）');
         } else {
-          showStatus('success', '下载完成，已保存为 MP4');
+          showStatus(
+            'success',
+            result.actualQn && result.requestedQn && result.actualQn !== result.requestedQn
+              ? `下载完成（请求 ${result.requestedQn}P 无 H.264，已存 ${result.actualQn}P）`
+              : '下载完成，已保存为 MP4'
+          );
         }
       } catch (err) {
         hideProgress();
