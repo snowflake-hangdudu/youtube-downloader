@@ -29,7 +29,7 @@
 | popup API | `__BILI_DL_API__` / `BILI_DL_*` | `__YT_DL_API__` / `YT_DL_*` |
 | 匹配页 | `/video/BV…` | `/watch?v=`、`/shorts/` |
 | CSS 变量 | `--bdl-*` | `--ytd-*`（主色红 `#dc2626`） |
-| CDN 下载 | **必须** MAIN world（后台 403） | **优先 background** 单连接拉 googlevideo（页面 CORS）；MAIN 负责解析/合并 |
+| CDN 下载 | **必须** MAIN world（后台 403） | **优先 background** Range 并行拉 googlevideo；MAIN 负责解析/合并 |
 | 高清来源 | B 站 playurl dash | **InnerTube `android_vr`（钉死 1.65.10）** 直链；WEB 常仅 SABR |
 | 进度 | MAIN `PROGRESS` postMessage | background `YT_DL_BG_PROGRESS` → content |
 
@@ -70,7 +70,7 @@ InnerTube: android_vr … usable>0 maxH=720+|1440
 合并 → 保存
 ```
 
-> 「候选 N 条」= URL 候选数（失败会换下一条）。下载为 **单连接顺序**拉取，不做 Range 并行分片。
+> 「候选 N 条」= 去重后的 URL。≥2MB 走 **2MB×6 并发 Range**；断线 **分片内续传**。
 
 ---
 
@@ -210,6 +210,8 @@ const AGENT = 'yt-dl-agent';  // page-agent.js 发出
 | `YT_DL_BG_FETCH` | content→SW | 多 URL 回退、单连接顺序下载 |
 | `YT_DL_BG_FETCH_CONCAT` | content→SW | HLS 多分片顺序拼接 |
 | `YT_DL_BG_PROGRESS` | SW→content | `{ step, percent, received, total }` → `updateProgress` |
+| `YT_DL_BG_LOG` | SW→content | 详细步骤进调试区 |
+| `YT_DL_BG_GET_CHUNK` / `YT_DL_BG_RELEASE` | content↔SW | 大文件 **base64** 分块回传（ArrayBuffer 消息在 Edge 会空包） |
 | `YT_DL_BG_ABORT` | content→SW | 取消当前 tab 下载 |
 | `YT_DL_GET_SNIFFED` | content→SW | 取 webRequest 嗅探到的 googlevideo URL |
 
@@ -289,17 +291,20 @@ fetchSnapshot → RESOLVE_VIDEO → readPlayerResponse()
 
 ### 6.4 background 下载与进度
 
-- `fetchOne` → 单连接顺序流式下载（**不做** Range 并行分片）  
-- `readBodyWithStall`：约 45s 无字节判假死，换候选 URL  
-- `makeThrottledProgress`：约 80ms 节流，0%/100%/百分比跳变必达  
-- 多候选 URL 顺序回退；再失败可尝试 `chrome.downloads`  
-- UI 若「像卡住」：查是否假死换线；音视频阶段重置为 0 属正常；调试区每 8s 有心跳  
+- `fetchOne`：体积 ≥2MB → **2MB 分块 × 最多 6 路并发**；否则单连接；分片/连接断线 → **Range 续传**
+- 候选 URL 按 `id|itag|clen` **去重**（避免 withFullRange 伪候选导致断线重头下）；失败可换 Chrome UA 再试
+- `readBodyWithStall`：约 **45s 无字节** 或 **20s 吞吐 <32KB** → 假死；已收字节可带 `partial` 供续传
+- 有 `Content-Length` / `clen` 时要求收满 **≥95%**，否则续传或失败
+- `makeThrottledProgress`：约 80ms 节流；调试区有并行/续传日志（`YT_DL_BG_LOG`）
+- 多候选 URL 顺序回退；再失败可尝试 `chrome.downloads` 
 
-### 6.5 合并
+### 6.5 合并与落盘
 
+- DASH：视频 bg 完成后**先** `<a download>` 存无声视频轨；音频成功合并后再存一份有声成品（共 2 文件）
 - 注入 `lib/mp4-remux.iife.js`、`lib/m4s-mux.js`（**外链**，禁内联）  
 - content → page-agent：`MERGE_BUFFERS` 用 **transferable** 移交 ArrayBuffer（零拷贝），避免大文件 structured clone 卡死  
 - `YtM4sMux.mergeM4s`；禁止依赖 FFmpeg.wasm  
+- 调试：background 经 `YT_DL_BG_LOG` 刷面板；调试区上限约 800 行 
 
 ---
 
@@ -385,6 +390,7 @@ edge://extensions → 开发者模式 → 加载已解压 → youtube-downloader
   videoOnlyFilename?: string,
   userAgent?: string,
   itag?, audioItag?,
+  videoExpectedBytes?, audioExpectedBytes?,  // contentLength/clen，供收满校验
   hls?: true, urls?: string[]   // HLS concat
 }
 
@@ -425,7 +431,9 @@ python scripts/gen_store_assets.py
 | `hlsManifestUrl` 常为空 | bot / SABR；日志诚实写「无 HLS」 |
 | InnerTube bot / LOGIN_REQUIRED | visitorData + 登录确认机器人 + F5 |
 | 高清 403 | VR UA、换候选 URL、嗅探播放后的链 |
-| 进度「卡住」 | 假死 45s 换线；分片流式进度；音视频阶段重置为 0 正常；需**重载扩展**拿新 SW |
+| 进度「卡住」 | 无字节 45s / 吞吐过慢 20s；并行分片内会 Range 续传；音视频阶段重置为 0 正常；需**重载扩展**拿新 SW |
+| 视频「完成 N MB」却报无 ArrayBuffer / 取回 0B | SW→content **禁止**直传 ArrayBuffer；改 **base64 分块** |
+| 单连接过慢 / 80% 断线重头下 | 2MB×6 并发；分片 Range 续传；候选按 itag/clen 去重 |
 | 下载完无法合成 | MERGE 用 transferable 零拷贝 |
 | 视频完音频慢/失败 | 音频走 background；校验最终文件有声 |
 | `ERR_CONTENT_LENGTH_MISMATCH` | 勿仅以提示成功为准，本地点开听 |
@@ -443,7 +451,7 @@ python scripts/gen_store_assets.py
 | 选流 / 下载入口 | `page-agent.js` | `pickStreamsForQn`, `handleDownload`, `handleHlsDownload` |
 | HLS | `page-agent.js` | `loadHlsBundle`, `mergeHlsIntoQualities` |
 | 合并 | `page-agent.js`, `lib/m4s-mux.js` | `MERGE_BUFFERS`, `mergeM4sInPage` |
-| 顺序下载 / 进度 | `background.js` | `fetchOne`, `fetchOneSequential`, `makeThrottledProgress` |
+| 顺序下载 / 进度 | `background.js` | `fetchOne`, `fetchOneParallel`, `fetchByteRange`, `fetchOneSequentialResumable` |
 | 嗅探 | `background.js` | `rememberTabGv`, `YT_DL_GET_SNIFFED` |
 | bg 编排 | `content.js` | `bgFetch`, `bgFetchConcat`, `runSingleDownload` |
 | 进度 UI | `content.js` | `updateProgress` |

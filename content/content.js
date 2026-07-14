@@ -9,8 +9,136 @@
   const VERSION = chrome.runtime.getManifest().version;
   const ICON_URL = chrome.runtime.getURL('icons/icon128.png');
   const FAQ_URL = 'https://snowflake-hangdudu.github.io/youtube-downloader/faq.html';
+  const MIN_VIDEO_BYTES = 50 * 1024;
+  const MIN_AUDIO_BYTES = 8 * 1024;
+  const EXPECT_RATIO = 0.95;
 
   let muxReadyPromise = null;
+  /** 最近一次 bg 进度（给心跳文案用） */
+  let lastBgProgress = { step: '', received: 0, total: 0, percent: 0, at: 0 };
+
+  function formatBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + 'B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + 'KB';
+    return (n / 1024 / 1024).toFixed(2) + 'MB';
+  }
+
+  function respBytes(resp) {
+    const fromBuf = resp?.buffer?.byteLength;
+    if (typeof fromBuf === 'number' && fromBuf > 0) return fromBuf;
+    return Number(resp?.size) || 0;
+  }
+
+  function b64ToU8(b64) {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8;
+  }
+
+  /** SW 大文件：base64 分块回传（本环境 ArrayBuffer 消息会变成空对象） */
+  async function pullChunkedBuffer(resp) {
+    if (resp?.buffer && typeof resp.buffer.byteLength === 'number' && resp.buffer.byteLength > 0) {
+      return resp;
+    }
+    if (resp?.mode !== 'chunked' || !resp.transferId) {
+      return resp;
+    }
+    const chunks = Number(resp.chunks) || 0;
+    const chunkSize = Number(resp.chunkSize) || 512 * 1024;
+    const expect = Number(resp.size) || 0;
+    if (chunks < 1 || expect < 1) {
+      throw new Error('分块回传元数据无效');
+    }
+    const dlog = (m) => {
+      if (typeof debugLog === 'function') debugLog('bg', m);
+      else console.log('[YtDL]', m);
+    };
+    dlog(
+      `分块取回开始 · ${chunks} 片×${formatBytes(chunkSize)} · 期望 ${formatBytes(expect)}` +
+        ` · enc=${resp.encoding || 'bin'}`
+    );
+    const parts = [];
+    let got = 0;
+    for (let i = 0; i < chunks; i++) {
+      const r = await chrome.runtime.sendMessage({
+        type: 'YT_DL_BG_GET_CHUNK',
+        transferId: resp.transferId,
+        index: i,
+        chunkSize
+      });
+      if (!r?.ok) {
+        throw new Error(`取回分块 #${i}/${chunks} 失败: ${r?.error || '空响应'}`);
+      }
+      let u8;
+      if (r.encoding === 'base64' && typeof r.data === 'string') {
+        u8 = b64ToU8(r.data);
+      } else if (r.chunk instanceof ArrayBuffer && r.chunk.byteLength > 0) {
+        u8 = new Uint8Array(r.chunk);
+      } else if (ArrayBuffer.isView(r.chunk) && r.chunk.byteLength > 0) {
+        u8 = new Uint8Array(r.chunk.buffer, r.chunk.byteOffset, r.chunk.byteLength);
+      } else {
+        throw new Error(
+          `取回分块 #${i} 无效 · encoding=${r.encoding || '?'} · ` +
+            `byteLength声称=${r.byteLength || 0} · typeof data=${typeof r.data} · typeof chunk=${typeof r.chunk}`
+        );
+      }
+      if (r.byteLength && u8.byteLength !== r.byteLength) {
+        throw new Error(
+          `取回分块 #${i} 长度不符 decode=${u8.byteLength} claim=${r.byteLength}`
+        );
+      }
+      if (u8.byteLength < 1) {
+        throw new Error(`取回分块 #${i} 解码后为空`);
+      }
+      parts.push(u8);
+      got += u8.byteLength;
+      if (i === 0 || i === chunks - 1 || (i + 1) % 8 === 0) {
+        dlog(`分块取回 ${i + 1}/${chunks} · ${formatBytes(got)}/${formatBytes(expect)}`);
+      }
+    }
+    try {
+      await chrome.runtime.sendMessage({
+        type: 'YT_DL_BG_RELEASE',
+        transferId: resp.transferId
+      });
+    } catch (_) {}
+
+    const out = new Uint8Array(got);
+    let off = 0;
+    for (const p of parts) {
+      out.set(p, off);
+      off += p.byteLength;
+    }
+    if (expect > 0 && got < expect * 0.95) {
+      throw new Error(`分块取回不完整 ${formatBytes(got)}/${formatBytes(expect)}`);
+    }
+    dlog(`分块取回完成 · ${formatBytes(got)}`);
+    resp.buffer = out.buffer;
+    resp.size = got;
+    resp.mode = 'buffer';
+    delete resp.transferId;
+    return resp;
+  }
+
+  function assertBgMedia(resp, step, minBytes, expectedBytes) {
+    const bytes = respBytes(resp);
+    if (!resp?.buffer || typeof resp.buffer.byteLength !== 'number') {
+      throw new Error(`${step} 无有效数据（消息未带回 ArrayBuffer）`);
+    }
+    if (bytes < minBytes) {
+      throw new Error(`${step} 过小 ${formatBytes(bytes)}（疑似空壳/断流）`);
+    }
+    const expect = Number(expectedBytes) || 0;
+    if (expect > minBytes && bytes < expect * EXPECT_RATIO) {
+      const pct = Math.round((bytes / expect) * 100);
+      throw new Error(
+        `${step} 未收满 ${formatBytes(bytes)}/${formatBytes(expect)}（${pct}%）`
+      );
+    }
+    return bytes;
+  }
 
   /** YouTube SPA：DOM 事件优先，轮询兜底（ISOLATED 无法拦截 MAIN 的 history） */
   function watchUrlChange(onChange, intervalMs = 2000) {
@@ -132,6 +260,9 @@
   }
 
   function downloadBlob(blob, filename) {
+    if (typeof debugLog === 'function') {
+      debugLog('保存', `触发浏览器下载 · ${filename} · ${formatBytes(blob?.size || 0)}`);
+    }
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -146,6 +277,21 @@
         resolve();
       }, 1000);
     });
+  }
+
+  function peekMagic(buf, n = 8) {
+    try {
+      let u8;
+      if (buf instanceof ArrayBuffer) u8 = new Uint8Array(buf, 0, Math.min(n, buf.byteLength));
+      else if (ArrayBuffer.isView(buf))
+        u8 = new Uint8Array(buf.buffer, buf.byteOffset, Math.min(n, buf.byteLength));
+      else return '-';
+      return Array.from(u8)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join(' ');
+    } catch (_) {
+      return '?';
+    }
   }
 
   function formatView(n) {
@@ -380,7 +526,7 @@
     const debugCopyBtn = panel.querySelector('#yt-dl-debug-copy');
     const btnDefaultHtml = startBtn.innerHTML;
     const debugLines = [];
-    const DEBUG_MAX = 300;
+    const DEBUG_MAX = 800;
 
     function setQueueLabel(count) {
       queueLabelEl.textContent = count > 1 ? `队列下载全部 ${count} 个分 P` : '队列下载全部分 P';
@@ -847,7 +993,7 @@
         bytes: resp?.buffer?.byteLength
       });
       if (!resp?.ok) throw new Error(resp?.error || 'HLS background 合并失败');
-      return resp;
+      return pullChunkedBuffer(resp);
     }
 
     async function bgFetch(urls, filename, step, userAgent, itag) {
@@ -868,10 +1014,26 @@
         ua: userAgent ? String(userAgent).slice(0, 40) : 'default',
         sample: (finalUrls[0] || '').slice(0, 120)
       });
+      lastBgProgress = { step: step || 'download', received: 0, total: 0, percent: 0, at: Date.now() };
       let ticks = 0;
       const hb = setInterval(() => {
         ticks += 1;
-        debugLog('bg', `${step || 'download'} 进行中… ${ticks * 8}s（进度条应在涨；若长时间不动会自动换线路）`);
+        const p = lastBgProgress;
+        const sameStep = !p.step || p.step === (step || 'download');
+        const recv = sameStep ? p.received : 0;
+        const tot = sameStep ? p.total : 0;
+        const pct = sameStep ? p.percent : 0;
+        const prog =
+          tot > 0
+            ? `${formatBytes(recv)}/${formatBytes(tot)} · ${pct}%`
+            : recv > 0
+              ? `${formatBytes(recv)}（未知总量）`
+              : '尚无字节';
+        debugLog(
+          'bg',
+          `${step || 'download'} 进行中… ${ticks * 8}s · ${prog}` +
+            '（断线会 Range 续传；块失败会重试）'
+        );
       }, 8000);
       let resp;
       try {
@@ -903,10 +1065,8 @@
       if (!resp?.ok) {
         throw new Error(resp?.error || 'background 下载失败（无详细信息）');
       }
-      debugLog(
-        'bg',
-        `${step || 'download'} 完成 · ${((resp.buffer?.byteLength || resp.size || 0) / 1024 / 1024).toFixed(1)}MB`
-      );
+      resp = await pullChunkedBuffer(resp);
+      debugLog('bg', `${step || 'download'} 完成 · ${formatBytes(respBytes(resp))}`);
       return resp;
     }
 
@@ -930,10 +1090,19 @@
         const ua = result.userAgent || null;
         debugLog(
           '音频',
-          `视频已就绪 ${(result.videoBytes / 1024 / 1024).toFixed(1)}MB，改 background 拉音频`
+          `视频已就绪 ${formatBytes(result.videoBytes)}，先落盘视频轨，再 background 拉音频`
         );
         updateProgress('audio', 0);
+        let videoSavedEarly = false;
         try {
+          debugLog('保存', `① 视频轨先存浏览器 · ${result.videoOnlyFilename || 'video.mp4'}`);
+          await agentCall('SAVE_PENDING_VIDEO', {
+            filename: result.videoOnlyFilename || 'video.mp4',
+            keep: true
+          });
+          videoSavedEarly = true;
+          debugLog('保存', '① 已触发；继续拉音频');
+
           const aResp = await bgFetch(
             result.audioUrls || [],
             'audio.m4a',
@@ -941,13 +1110,16 @@
             ua,
             result.audioItag || null
           );
-          if (!aResp.buffer || aResp.buffer.byteLength < 1024) {
-            throw new Error('background 音频过小');
-          }
+          assertBgMedia(aResp, 'audio', MIN_AUDIO_BYTES, result.audioExpectedBytes || 0);
+          debugLog(
+            'DASH',
+            `音频 OK · ${formatBytes(respBytes(aResp))} · magic=${peekMagic(aResp.buffer)}`
+          );
           updateProgress('merge', 5);
           await setupMuxInPage();
           const transfer = [];
           if (aResp.buffer instanceof ArrayBuffer) transfer.push(aResp.buffer);
+          debugLog('合并', 'MERGE_PENDING_VIDEO（页面会再存成品）');
           const merged = await agentCall(
             'MERGE_PENDING_VIDEO',
             {
@@ -957,19 +1129,28 @@
             transfer
           );
           updateProgress('save', 100);
-          return { merged: true, bytes: merged?.size || 0, via: 'bg-audio' };
+          debugLog('保存', `② 合并成品已存 · ${formatBytes(merged?.size || 0)}`);
+          return { merged: true, bytes: merged?.size || 0, via: 'bg-audio', videoSavedEarly: true };
         } catch (e) {
           console.warn('[YtDL:content] background 音频也失败，仅存视频', e);
-          debugLog('音频', 'background 也失败，仅保存视频轨: ' + (e.message || e));
-          try {
-            await agentCall('SAVE_PENDING_VIDEO', {
-              filename: result.videoOnlyFilename || 'video.mp4'
-            });
-          } catch (e2) {
-            throw new Error('音频失败且保存视频轨失败: ' + (e2.message || e2));
+          debugLog('音频', 'background 也失败: ' + (e.message || e));
+          if (!videoSavedEarly) {
+            try {
+              await agentCall('SAVE_PENDING_VIDEO', {
+                filename: result.videoOnlyFilename || 'video.mp4',
+                keep: false
+              });
+            } catch (e2) {
+              throw new Error('音频失败且保存视频轨失败: ' + (e2.message || e2));
+            }
+          } else {
+            debugLog('保存', '视频轨已先落盘，跳过重复保存');
+            try {
+              await agentCall('SAVE_PENDING_VIDEO', { clearOnly: true });
+            } catch (_) {}
           }
           updateProgress('save', 100);
-          return { videoOnly: true, audioFailed: true };
+          return { videoOnly: true, audioFailed: true, videoSavedEarly };
         }
       }
 
@@ -995,6 +1176,12 @@
         }
         if (result.dash) {
           updateProgress('video', 0);
+          debugLog(
+            'DASH',
+            `开始 · video候选=${(result.videoUrls || []).length} audio候选=${(result.audioUrls || []).length}` +
+              ` · expectV=${formatBytes(result.videoExpectedBytes || 0)} expectA=${formatBytes(result.audioExpectedBytes || 0)}` +
+              ` · itag=${result.itag || '-'} aitag=${result.audioItag || '-'}`
+          );
           const vResp = await bgFetch(
             result.videoUrls || [],
             result.videoOnlyFilename || 'video.mp4',
@@ -1003,50 +1190,75 @@
             result.itag || null
           );
           if (vResp.mode === 'downloads') {
-            if ((vResp.size || 0) < 50 * 1024) throw new Error('视频文件过小');
+            if ((vResp.size || 0) < MIN_VIDEO_BYTES) throw new Error('视频文件过小');
+            debugLog('DASH', `视频走 downloads API · id=${vResp.downloadId} · ${formatBytes(vResp.size)}`);
             return { via: 'downloads', downloadId: vResp.downloadId };
           }
-          if (!vResp.buffer || vResp.buffer.byteLength < 50 * 1024) {
-            throw new Error('视频数据过小（' + (vResp.buffer?.byteLength || 0) + ' bytes）');
-          }
+          const vBytes = assertBgMedia(vResp, 'video', MIN_VIDEO_BYTES, result.videoExpectedBytes || 0);
+          debugLog(
+            'DASH',
+            `视频 OK · ${formatBytes(vBytes)} · magic=${peekMagic(vResp.buffer)} · used=#${vResp.usedIndex ?? '?'}`
+          );
+
+          const videoOnlyName = result.videoOnlyFilename || 'video.mp4';
+          // 视频先落盘；合并成功后再存一份有声成品（便于断在音频/合并时仍有文件）
+          const vBlobEarly = new Blob([vResp.buffer], { type: 'video/mp4' });
+          debugLog('保存', `① 视频轨先存浏览器 · ${videoOnlyName}`);
+          await downloadBlob(vBlobEarly, videoOnlyName);
+          const videoSavedEarly = true;
+          debugLog('保存', '① 已触发；继续拉音频（合并后会再存成品）');
 
           if (!(result.audioUrls || []).length) {
-            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
-            await downloadBlob(vBlob, result.videoOnlyFilename || result.filename || 'video.mp4');
             updateProgress('save', 100);
-            return { videoOnly: true };
+            return { videoOnly: true, videoSavedEarly };
           }
 
           updateProgress('audio', 0);
           let aResp;
           try {
             aResp = await bgFetch(result.audioUrls, 'audio.m4a', 'audio', ua, result.audioItag || null);
+            const aBytes = assertBgMedia(
+              aResp,
+              'audio',
+              MIN_AUDIO_BYTES,
+              result.audioExpectedBytes || 0
+            );
+            debugLog(
+              'DASH',
+              `音频 OK · ${formatBytes(aBytes)} · magic=${peekMagic(aResp.buffer)} · used=#${aResp.usedIndex ?? '?'}`
+            );
           } catch (e) {
             console.warn('[YtDL:content] 音频失败，仅存视频轨', e);
-            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
-            await downloadBlob(vBlob, result.videoOnlyFilename || 'video.mp4');
+            debugLog('音频', '失败（视频轨已先落盘，跳过重复保存）: ' + (e.message || e));
             updateProgress('save', 100);
-            return { videoOnly: true };
+            return { videoOnly: true, videoSavedEarly, audioFailed: true };
           }
 
-          if (aResp.mode === 'downloads' || !aResp.buffer || aResp.buffer.byteLength < 1024) {
-            const vBlob = new Blob([vResp.buffer], { type: 'video/mp4' });
-            await downloadBlob(vBlob, result.videoOnlyFilename || 'video.mp4');
+          if (aResp.mode === 'downloads') {
+            debugLog('音频', '走 downloads，无法合并；视频轨已先落盘');
             updateProgress('save', 100);
-            return { videoOnly: true };
+            return { videoOnly: true, videoSavedEarly };
           }
 
           const totalBytes = vResp.buffer.byteLength + aResp.buffer.byteLength;
           updateProgress('merge', 5, totalBytes, totalBytes);
           debugLog(
             '合并',
-            `页面合成（零拷贝移交）· 视频 ${(vResp.buffer.byteLength / 1024 / 1024).toFixed(1)}MB + 音频 ${(aResp.buffer.byteLength / 1024 / 1024).toFixed(1)}MB`
+            `页面合成（零拷贝移交）· 视频 ${formatBytes(vResp.buffer.byteLength)} + 音频 ${formatBytes(aResp.buffer.byteLength)}`
           );
+          const tMerge = Date.now();
           const mergedBlob = await mergeBuffersViaPage(vResp.buffer, aResp.buffer);
+          debugLog(
+            '合并',
+            `完成 · ${formatBytes(mergedBlob.size)} · ${Date.now() - tMerge}ms · magic=${peekMagic(await mergedBlob.slice(0, 8).arrayBuffer())}`
+          );
           updateProgress('save', 95);
-          await downloadBlob(mergedBlob, result.filename || 'youtube.mp4');
+          const mergedName = result.filename || 'youtube.mp4';
+          debugLog('保存', `② 合并成品再存一份 · ${mergedName}`);
+          await downloadBlob(mergedBlob, mergedName);
           updateProgress('save', 100);
-          return { merged: true, bytes: mergedBlob.size };
+          debugLog('保存', '② 已触发 · 共 2 个文件（无声视频轨 + 有声 MP4）');
+          return { merged: true, bytes: mergedBlob.size, videoSavedEarly: true };
         }
 
         updateProgress('download', 0);
@@ -1058,17 +1270,13 @@
           result.itag || null
         );
         if (resp.mode === 'downloads') {
-          if ((resp.size || 0) < 50 * 1024) {
-            throw new Error('浏览器下载文件过小（' + (resp.size || 0) + ' bytes），已视为失败');
+          if ((resp.size || 0) < MIN_VIDEO_BYTES) {
+            throw new Error('浏览器下载文件过小（' + formatBytes(resp.size || 0) + '），已视为失败');
           }
           updateProgress('save', 100);
           return { dash: false, via: 'downloads', downloadId: resp.downloadId, size: resp.size };
         }
-        if (!resp.buffer || resp.buffer.byteLength < 50 * 1024) {
-          throw new Error(
-            '后台返回数据过小（' + (resp.buffer?.byteLength || 0) + ' bytes），拒绝保存空文件'
-          );
-        }
+        assertBgMedia(resp, 'download', MIN_VIDEO_BYTES, result.videoExpectedBytes || 0);
         const blob = new Blob([resp.buffer], { type: 'video/mp4' });
         updateProgress('save', 95);
         await downloadBlob(blob, resp.filename || result.filename || 'youtube.mp4');
@@ -1107,7 +1315,7 @@
           showStatus(
             'success',
             result.audioFailed
-              ? '视频已保存（无声音）。音频轨下载失败，可改较低清晰度重试'
+              ? '视频轨已保存（无声音）。音频失败，可改较低清晰度重试'
               : '已下载视频轨（无音频）'
           );
         } else if (result.via === 'downloads') {
@@ -1119,6 +1327,8 @@
               ? 'HLS 下载完成（.ts，可用 VLC 播放）'
               : 'HLS 下载完成，已保存'
           );
+        } else if (result.videoSavedEarly && result.merged) {
+          showStatus('success', '完成：已先存视频轨，再存合并 MP4（共 2 个文件）');
         } else {
           showStatus('success', '下载完成，已保存为 MP4');
         }
@@ -1261,7 +1471,22 @@
   waitAndMount();
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type === 'YT_DL_BG_LOG') {
+      if (typeof debugLog === 'function') {
+        debugLog(msg.step || 'bg', msg.msg || '');
+      } else {
+        console.log('[YtDL:bg→content]', msg.step, msg.msg);
+      }
+      return;
+    }
     if (msg?.type === 'YT_DL_BG_PROGRESS') {
+      lastBgProgress = {
+        step: msg.step || 'download',
+        received: Number(msg.received) || 0,
+        total: Number(msg.total) || 0,
+        percent: Number(msg.percent) || 0,
+        at: Date.now()
+      };
       if (typeof updateProgress === 'function') {
         updateProgress(msg.step || 'download', msg.percent, msg.received, msg.total);
       }

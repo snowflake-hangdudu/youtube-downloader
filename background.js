@@ -11,6 +11,14 @@ const activeFetches = new Map();
 const MIN_BYTES = 50 * 1024; // 小于 50KB 视为失败（排除 1B 空壳）
 /** tabId -> [{url, itag, at, status}] 播放器真实 googlevideo */
 const tabSniff = new Map();
+/** transferId -> { buffer, tabId, at } 大文件分块回传暂存 */
+const pendingTransfers = new Map();
+let transferSeq = 0;
+/**
+ * Edge/Chrome：content←SW 的 ArrayBuffer structured clone 会变成空对象（已实测 4MB 也是 0B）。
+ * 一律用 base64 字符串分块回传。
+ */
+const TRANSFER_CHUNK = 512 * 1024; // 二进制 512KB → base64 ~680KB / 消息
 
 const CHROME_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -130,29 +138,34 @@ function looksLikeMedia(contentType) {
   );
 }
 
-/** 用 clen 补全 range=0-(clen-1)，部分节点对完整 GET 更友好 */
-function withFullRange(url) {
+/** 去掉 range 后按 id|itag|clen 去重（旧逻辑 withFullRange 会把同一流变成 2 条候选，断线后白从头下） */
+function gvDedupeKey(url) {
   try {
-    const u = new URL(url);
-    const clen = u.searchParams.get('clen');
-    if (clen && /^\d+$/.test(clen) && Number(clen) > 1024) {
-      u.searchParams.set('range', '0-' + (Number(clen) - 1));
-      return u.toString();
-    }
-  } catch (_) {}
-  return null;
+    const u = new URL(stripRangeQuery(url));
+    return [
+      u.hostname,
+      u.searchParams.get('id') || '',
+      u.searchParams.get('itag') || '',
+      u.searchParams.get('clen') || ''
+    ].join('|');
+  } catch {
+    return String(url);
+  }
 }
 
 function expandUrls(urls) {
   const out = [];
   const seen = new Set();
-  for (const url of urls) {
-    for (const u of [url, withFullRange(url)]) {
-      if (!u || seen.has(u)) continue;
-      seen.add(u);
-      out.push(u);
-    }
+  for (const raw of urls || []) {
+    const u = stripRangeQuery(raw);
+    if (!u) continue;
+    const key = gvDedupeKey(u);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(u);
   }
+  // 同一次下载优先大体量（主 itag），避免先成再切到更小的备用 itag
+  out.sort((a, b) => (getClen(b) || 0) - (getClen(a) || 0));
   return out;
 }
 
@@ -209,10 +222,77 @@ function stripRangeQuery(url) {
   }
 }
 
-const STALL_MS = 45000; // 长时间无字节 → 判为假死
+const STALL_NO_BYTE_MS = 45000; // 完全无字节 → 假死
+const STALL_SLOW_WINDOW_MS = 20000; // 吞吐窗口
+const STALL_SLOW_MIN_BYTES = 32 * 1024; // 窗口内增量不足 → 假死（防滴水连接永不换线）
+const EXPECT_RATIO = 0.95; // 有已知体积时至少收满 95%
+/** 小分块更贴播放器行为，也更容易在断线后续传单段 */
+const CHUNK_SIZE = 2 * 1024 * 1024;
+const PARALLEL_WORKERS = 6; // 同时飞行的 Range 数
+const PARALLEL_MIN_BYTES = 2 * 1024 * 1024; // 小于此体积走单连接+续传
+const MAX_RESUME_ATTEMPTS = 10; // 单次/单分片最大续传次数
 
-/** 带假死检测的 body 读取 */
-async function readBodyWithStall(res, signal, onBytes, stallMs = STALL_MS) {
+function formatBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + 'B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + 'KB';
+  return (n / 1024 / 1024).toFixed(2) + 'MB';
+}
+
+function isAbortErr(e, signal) {
+  return e?.name === 'AbortError' || signal?.aborted || /下载已取消|Aborted/i.test(e?.message || '');
+}
+
+function isResumableErr(e) {
+  const m = e?.message || String(e || '');
+  if (/下载已取消|Aborted|HTTP 403|HTTP 401|HTTP 404|非媒体|忽略 Range|无法续传/i.test(m)) {
+    return false;
+  }
+  return true;
+}
+
+function concatChunks(chunks, totalSize) {
+  const size = totalSize != null ? totalSize : chunks.reduce((s, c) => s + c.byteLength, 0);
+  const out = new Uint8Array(size);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
+
+function peekMagicU8(u8, n = 8) {
+  const len = Math.min(n, u8.byteLength);
+  const head = u8.subarray(0, len);
+  return Array.from(head)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join(' ');
+}
+
+/** 打到页面调试区（content 监听 YT_DL_BG_LOG） */
+function tabLog(tabId, step, msg) {
+  if (tabId == null) return;
+  chrome.tabs
+    .sendMessage(tabId, {
+      type: 'YT_DL_BG_LOG',
+      step: step || 'bg',
+      msg: String(msg)
+    })
+    .catch(() => {});
+}
+
+function resolveExpectedTotal(res, url) {
+  let total = parseInt(res.headers.get('content-length') || '0', 10) || 0;
+  const cr = res.headers.get('content-range') || '';
+  const m = cr.match(/\/(\d+)\s*$/);
+  if (m) total = parseInt(m[1], 10) || total;
+  if (!total) total = getClen(url) || 0;
+  return total;
+}
+
+/** 带假死检测的 body 读取；中断时 err.partial = 已收字节 */
+async function readBodyWithStall(res, signal, onBytes, stallMs = STALL_NO_BYTE_MS) {
   if (!res.body || !res.body.getReader) {
     const buf = new Uint8Array(await res.arrayBuffer());
     if (onBytes) onBytes(buf.byteLength);
@@ -223,94 +303,426 @@ async function readBodyWithStall(res, signal, onBytes, stallMs = STALL_MS) {
   const chunks = [];
   let size = 0;
   let lastByteAt = Date.now();
-  let stalled = false;
+  let gotFirstByte = false;
+  let windowStart = Date.now();
+  let windowBytes = 0;
+  let stallReason = null;
 
   const stallWatch = setInterval(() => {
-    if (signal?.aborted) return;
-    if (Date.now() - lastByteAt > stallMs) {
-      stalled = true;
+    if (signal?.aborted || stallReason) return;
+    const now = Date.now();
+    if (now - lastByteAt > stallMs) {
+      stallReason = `无数据>${Math.round(stallMs / 1000)}s`;
       try {
         reader.cancel('stall');
       } catch (_) {}
+      return;
     }
-  }, 3000);
+    if (gotFirstByte && now - windowStart >= STALL_SLOW_WINDOW_MS) {
+      if (windowBytes < STALL_SLOW_MIN_BYTES) {
+        stallReason =
+          `过慢 ${formatBytes(windowBytes)}/${Math.round(STALL_SLOW_WINDOW_MS / 1000)}s` +
+          `（需≥${formatBytes(STALL_SLOW_MIN_BYTES)}）`;
+        try {
+          reader.cancel('stall');
+        } catch (_) {}
+        return;
+      }
+      windowStart = now;
+      windowBytes = 0;
+    }
+  }, 2000);
+
+  const assemble = () => concatChunks(chunks, size);
 
   try {
     while (true) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const { done, value } = await reader.read();
       if (done) break;
+      if (!value || !value.length) continue;
       chunks.push(value);
       size += value.length;
       lastByteAt = Date.now();
+      if (!gotFirstByte) {
+        gotFirstByte = true;
+        windowStart = Date.now();
+        windowBytes = 0;
+      }
+      windowBytes += value.length;
       if (onBytes) onBytes(value.length);
     }
+  } catch (e) {
+    clearInterval(stallWatch);
+    if (size > 0) e.partial = assemble();
+    throw e;
   } finally {
     clearInterval(stallWatch);
   }
 
-  if (stalled) {
-    throw new Error(`下载假死（>${Math.round(stallMs / 1000)}s 无数据）`);
+  if (stallReason) {
+    const err = new Error(`下载假死（${stallReason}，已收 ${formatBytes(size)}）`);
+    if (size > 0) err.partial = assemble();
+    throw err;
   }
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-  const out = new Uint8Array(size);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.length;
-  }
-  return out;
+  return assemble();
 }
 
-async function fetchOneSequential(url, signal, onProgress, userAgent) {
-  const clean = stripRangeQuery(url);
-  const res = await fetch(clean, {
-    method: 'GET',
-    headers: mediaHeaders(null, userAgent),
-    redirect: 'follow',
-    credentials: 'omit',
-    signal
-  });
-
-  const type = res.headers.get('content-type') || '';
-  if (!res.ok && res.status !== 206) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status} · ${String(url).slice(0, 90)} · ${t.slice(0, 60)}`);
+function assertDownloadComplete(received, expected) {
+  if (received < MIN_BYTES) {
+    throw new Error(`下载过小 ${formatBytes(received)}（疑似空壳/错误页）`);
   }
-  if (!looksLikeMedia(type)) {
-    throw new Error(`非媒体类型: ${type || '(空)'} · ${String(url).slice(0, 80)}`);
+  if (expected > MIN_BYTES && received < expected * EXPECT_RATIO) {
+    const pct = Math.round((received / expected) * 100);
+    throw new Error(
+      `未收满 ${formatBytes(received)}/${formatBytes(expected)}（${pct}%，疑似断流/残片）`
+    );
   }
+}
 
-  const total = parseInt(res.headers.get('content-length') || '0', 10) || getClen(clean) || 0;
-  onProgress({ received: 0, total, percent: 0 });
-
+function makeProgressTracker(onProgress, total, tabId) {
   let received = 0;
   let lastUi = 0;
-  const body = await readBodyWithStall(res, signal, (n) => {
-    received += n;
-    const now = Date.now();
-    if (now - lastUi < 100 && received < total) return;
-    lastUi = now;
-    onProgress({
-      received,
-      total,
-      percent: total ? Math.min(99, Math.round((received / total) * 100)) : 0
-    });
-  });
+  let lastTabPct = -1;
+  return {
+    add(n) {
+      received += n;
+      const now = Date.now();
+      const percent = total ? Math.min(99, Math.round((received / total) * 100)) : 0;
+      if (now - lastUi >= 80 || percent >= 99 || received >= total) {
+        lastUi = now;
+        onProgress({ received, total, percent });
+      }
+      if (total && percent - lastTabPct >= 10) {
+        lastTabPct = percent;
+        tabLog(tabId, 'bg', `收流 ${formatBytes(received)}/${formatBytes(total)} · ${percent}%`);
+      }
+    },
+    get received() {
+      return received;
+    }
+  };
+}
 
-  received = body.byteLength;
-  if (received < MIN_BYTES) {
-    throw new Error(`下载过小 ${received} bytes（疑似空壳/错误页）`);
+/** 拉取 [start, end]（含端点），支持中断后续传 */
+async function fetchByteRange(url, start, end, signal, userAgent, tabId, onBytes) {
+  const need = end - start + 1;
+  const chunks = [];
+  let got = 0;
+  let tries = 0;
+
+  while (got < need) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    tries += 1;
+    if (tries > MAX_RESUME_ATTEMPTS) {
+      throw new Error(`Range ${start}-${end} 续传超过 ${MAX_RESUME_ATTEMPTS} 次`);
+    }
+    const from = start + got;
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: mediaHeaders({ Range: `bytes=${from}-${end}` }, userAgent),
+        redirect: 'follow',
+        credentials: 'omit',
+        signal
+      });
+      if (!res.ok && res.status !== 206) {
+        const t = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} · Range ${from}-${end} · ${t.slice(0, 40)}`);
+      }
+      // 非 0 偏移却回 200 = 忽略 Range；并行分片起始也必须是 206
+      if (res.status === 200 && from > 0) {
+        throw new Error('服务器忽略 Range，无法续传');
+      }
+      if (res.status === 206) {
+        const cr = res.headers.get('content-range') || '';
+        const cm = cr.match(/bytes\s+(\d+)-/i);
+        if (cm && Number(cm[1]) !== from) {
+          throw new Error(`Range 偏移不符 want=${from} got=${cm[1]}`);
+        }
+      }
+      const type = res.headers.get('content-type') || '';
+      if (!looksLikeMedia(type)) {
+        throw new Error(`非媒体类型: ${type || '(空)'}`);
+      }
+
+      const piece = await readBodyWithStall(res, signal, onBytes);
+      if (!piece.byteLength) throw new Error('空分片');
+      chunks.push(piece);
+      got += piece.byteLength;
+
+      if (got < need) {
+        tabLog(
+          tabId,
+          'bg',
+          `Range 续传 ${from}+${formatBytes(piece.byteLength)} · 本段还差 ${formatBytes(need - got)}`
+        );
+      }
+    } catch (e) {
+      if (e.partial?.byteLength) {
+        chunks.push(e.partial);
+        got += e.partial.byteLength;
+        delete e.partial;
+      }
+      if (isAbortErr(e, signal)) throw e;
+      if (got > 0 && got < need && isResumableErr(e)) {
+        tabLog(
+          tabId,
+          'bg',
+          `Range 中断 @${start + got}（已 ${formatBytes(got)}/${formatBytes(need)}）重试: ${e.message || e}`
+        );
+        await new Promise((r) => setTimeout(r, 350));
+        continue;
+      }
+      throw e;
+    }
   }
-  onProgress({ received, total: total || received, percent: 100 });
-  log('fetch OK', (received / 1024 / 1024).toFixed(2) + 'MB · ' + type);
+
+  if (got > need) {
+    // 偶发多收：截断
+    return concatChunks(chunks, need);
+  }
+  return concatChunks(chunks, got);
+}
+
+async function probeTotalSize(url, userAgent, signal) {
+  const fromClen = getClen(url);
+  if (fromClen > 0) return fromClen;
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: mediaHeaders({ Range: 'bytes=0-0' }, userAgent),
+      redirect: 'follow',
+      credentials: 'omit',
+      signal
+    });
+    const total = resolveExpectedTotal(res, url);
+    try {
+      await res.body?.cancel?.();
+    } catch (_) {}
+    return total || 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+/** 单连接 + 断线 Range 续传（小文件 / 无总长时） */
+async function fetchOneSequentialResumable(url, signal, onProgress, userAgent, tabId) {
+  const clean = stripRangeQuery(url);
+  tabLog(tabId, 'bg', `单连接+续传 GET ${String(clean).slice(0, 140)}`);
+  const t0 = Date.now();
+  let total = getClen(clean) || 0;
+  const chunks = [];
+  let received = 0;
+  let attempt = 0;
+  let lastTabPct = -1;
+
+  const pushProgress = () => {
+    const percent = total ? Math.min(99, Math.round((received / total) * 100)) : 0;
+    onProgress({ received, total, percent });
+    if (total && percent - lastTabPct >= 10) {
+      lastTabPct = percent;
+      tabLog(tabId, 'bg', `收流 ${formatBytes(received)}/${formatBytes(total)} · ${percent}%`);
+    }
+  };
+
+  onProgress({ received: 0, total, percent: 0 });
+
+  while (true) {
+    attempt += 1;
+    if (attempt > MAX_RESUME_ATTEMPTS) {
+      throw new Error(`续传超过 ${MAX_RESUME_ATTEMPTS} 次（已收 ${formatBytes(received)}）`);
+    }
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+    const rangeHdr = received > 0 ? { Range: `bytes=${received}-` } : null;
+    if (received > 0) {
+      tabLog(tabId, 'bg', `续传自 ${formatBytes(received)}` + (total ? `/${formatBytes(total)}` : ''));
+    }
+
+    try {
+      const res = await fetch(clean, {
+        method: 'GET',
+        headers: mediaHeaders(rangeHdr, userAgent),
+        redirect: 'follow',
+        credentials: 'omit',
+        signal
+      });
+      const type = res.headers.get('content-type') || '';
+      tabLog(
+        tabId,
+        'bg',
+        `响应 HTTP ${res.status} · type=${type || '(空)'} · cl=${res.headers.get('content-length') || '-'} · cr=${res.headers.get('content-range') || '-'}`
+      );
+      if (!res.ok && res.status !== 206) {
+        const t = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} · ${t.slice(0, 60)}`);
+      }
+      if (res.status === 200 && received > 0) {
+        throw new Error('服务器忽略 Range，无法续传');
+      }
+      if (!looksLikeMedia(type)) {
+        throw new Error(`非媒体类型: ${type || '(空)'}`);
+      }
+
+      const expect = resolveExpectedTotal(res, clean);
+      if (expect > total) total = expect;
+
+      const piece = await readBodyWithStall(res, signal, (n) => {
+        received += n;
+        pushProgress();
+      });
+      chunks.push(piece);
+      // received 已在 onBytes 里累加
+
+      if (total && received < total * EXPECT_RATIO) {
+        tabLog(
+          tabId,
+          'bg',
+          `连接结束但未收满 ${formatBytes(received)}/${formatBytes(total)}，继续续传`
+        );
+        continue;
+      }
+      break;
+    } catch (e) {
+      if (e.partial?.byteLength) {
+        chunks.push(e.partial);
+        delete e.partial;
+      }
+      // onBytes 可能已累加但未入 chunks：统一按 chunks 重算，避免虚高/丢进度
+      received = chunks.reduce((s, c) => s + c.byteLength, 0);
+      pushProgress();
+      if (isAbortErr(e, signal)) throw e;
+      if (received > 0 && isResumableErr(e)) {
+        tabLog(tabId, 'bg', `中断已收 ${formatBytes(received)}，准备续传: ${e.message || e}`);
+        await new Promise((r) => setTimeout(r, 400));
+        continue;
+      }
+      throw e;
+    }
+  }
+
+  const body = concatChunks(chunks, received);
+  assertDownloadComplete(body.byteLength, total);
+  onProgress({ received: body.byteLength, total: total || body.byteLength, percent: 100 });
+  tabLog(
+    tabId,
+    'bg',
+    `收齐 ${formatBytes(body.byteLength)}` +
+      (total ? `/${formatBytes(total)}` : '') +
+      ` · ${Date.now() - t0}ms · magic=${peekMagicU8(body)} · 续传尝试=${attempt}`
+  );
   return body.buffer;
 }
 
-/** 单连接顺序下载（不做 Range 并行分片） */
-async function fetchOne(url, signal, onProgress, userAgent) {
-  return fetchOneSequential(url, signal, onProgress, userAgent);
+/** 小分块池 + 多 worker 并行（比「4 等分大切片」更抗断线、更贴近播放器） */
+async function fetchOneParallel(url, signal, onProgress, userAgent, tabId, total) {
+  const clean = stripRangeQuery(url);
+  const segments = [];
+  for (let start = 0; start < total; start += CHUNK_SIZE) {
+    const end = Math.min(total - 1, start + CHUNK_SIZE - 1);
+    segments.push({ start, end, i: segments.length, buf: null });
+  }
+  const workers = Math.min(PARALLEL_WORKERS, segments.length);
+  tabLog(
+    tabId,
+    'bg',
+    `分块并行 ${segments.length} 段×${formatBytes(CHUNK_SIZE)} · 并发 ${workers} · 总计 ${formatBytes(total)}`
+  );
+  const t0 = Date.now();
+  const tracker = makeProgressTracker(onProgress, total, tabId);
+  onProgress({ received: 0, total, percent: 0 });
+
+  let cursor = 0;
+  let doneCount = 0;
+  let failErr = null;
+
+  async function worker(wid) {
+    while (!failErr) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const idx = cursor++;
+      if (idx >= segments.length) return;
+      const seg = segments[idx];
+      try {
+        const buf = await fetchByteRange(
+          clean,
+          seg.start,
+          seg.end,
+          signal,
+          userAgent,
+          tabId,
+          (n) => tracker.add(n)
+        );
+        if (buf.byteLength !== seg.end - seg.start + 1) {
+          throw new Error(
+            `块#${seg.i} 长度不符 ${formatBytes(buf.byteLength)} ≠ ${formatBytes(seg.end - seg.start + 1)}`
+          );
+        }
+        seg.buf = buf;
+        doneCount += 1;
+        if (doneCount === 1 || doneCount === segments.length || doneCount % 5 === 0) {
+          tabLog(
+            tabId,
+            'bg',
+            `块进度 ${doneCount}/${segments.length} · w${wid} 完成 #${seg.i} ${formatBytes(buf.byteLength)}`
+          );
+        }
+      } catch (e) {
+        if (isAbortErr(e, signal)) throw e;
+        failErr = e;
+        throw e;
+      }
+    }
+  }
+
+  try {
+    await Promise.all(Array.from({ length: workers }, (_, i) => worker(i)));
+  } catch (e) {
+    if (isAbortErr(e, signal)) throw e;
+    // 已完成的块保留不了给外层（回退单连接），打日志便于对照
+    tabLog(
+      tabId,
+      'bg',
+      `并行中断 · 已完成块 ${doneCount}/${segments.length} · ${e.message || e}`
+    );
+    throw e;
+  }
+
+  const buffers = segments.map((s) => s.buf);
+  const body = concatChunks(buffers, total);
+  assertDownloadComplete(body.byteLength, total);
+  onProgress({ received: body.byteLength, total, percent: 100 });
+  tabLog(
+    tabId,
+    'bg',
+    `并行收齐 ${formatBytes(body.byteLength)}/${formatBytes(total)} · ${Date.now() - t0}ms · magic=${peekMagicU8(body)}`
+  );
+  log('fetch OK parallel', formatBytes(body.byteLength) + ' · ' + segments.length + ' chunks');
+  return body.buffer;
+}
+
+/** 入口：大文件并行，小文件/未知体积单连接+续传 */
+async function fetchOne(url, signal, onProgress, userAgent, tabId) {
+  const clean = stripRangeQuery(url);
+  let total = 0;
+  try {
+    total = await probeTotalSize(clean, userAgent, signal);
+  } catch (e) {
+    if (isAbortErr(e, signal)) throw e;
+  }
+
+  if (total >= PARALLEL_MIN_BYTES) {
+    try {
+      return await fetchOneParallel(url, signal, onProgress, userAgent, tabId, total);
+    } catch (e) {
+      if (isAbortErr(e, signal)) throw e;
+      tabLog(tabId, 'bg', `并行失败，回退单连接+续传: ${e.message || e}`);
+      return fetchOneSequentialResumable(url, signal, onProgress, userAgent, tabId);
+    }
+  }
+  return fetchOneSequentialResumable(url, signal, onProgress, userAgent, tabId);
 }
 
 function waitDownloadComplete(downloadId, timeoutMs) {
@@ -381,10 +793,27 @@ async function downloadWithFallback(urls, tabId, filename, sendProgress, userAge
   activeFetches.set(tabId, ac);
 
   const list = expandUrls(urls);
-  // 只快速探测前 2 条，避免启动慢
+  const uaChain = [];
+  if (userAgent) uaChain.push(userAgent);
+  if (!userAgent || userAgent !== CHROME_UA) uaChain.push(CHROME_UA);
+
+  tabLog(
+    tabId,
+    'bg',
+    `开始 · 原始 ${(urls || []).length} 条 → 去重 ${list.length} 条 · UA链=${uaChain.length}` +
+      ` · 首UA=${String(uaChain[0] || 'default').slice(0, 40)}`
+  );
+
+  // 只快速探测前 2 条
   const probes = [];
   for (const u of list.slice(0, 2)) {
-    probes.push(await probeUrl(u, userAgent));
+    const p = await probeUrl(u, uaChain[0] || null);
+    probes.push(p);
+    tabLog(
+      tabId,
+      'probe',
+      `#${probes.length - 1} ${p.ok ? 'OK' : 'FAIL'} status=${p.status || p.error || '?'} sample=${p.sampleBytes || 0}b · ${String(u).slice(0, 120)}`
+    );
   }
 
   const ordered = [];
@@ -401,22 +830,48 @@ async function downloadWithFallback(urls, tabId, filename, sendProgress, userAge
       ordered.push(u);
     }
   });
+  tabLog(
+    tabId,
+    'bg',
+    `候选顺序 ${ordered.length} 条 · clen=[${ordered.map((u) => formatBytes(getClen(u) || 0)).join(', ')}]`
+  );
 
   let lastErr = null;
   for (let i = 0; i < ordered.length; i++) {
     const url = ordered[i];
-    log(`try fetch ${i + 1}/${ordered.length}`, String(url).slice(0, 100));
-    try {
-      const buffer = await fetchOne(url, ac.signal, sendProgress, userAgent);
-      activeFetches.delete(tabId);
-      return { mode: 'buffer', buffer, probes, usedIndex: i };
-    } catch (e) {
-      if (e.name === 'AbortError' || ac.signal.aborted) {
+    for (let ui = 0; ui < uaChain.length; ui++) {
+      const ua = uaChain[ui];
+      log(`try fetch ${i + 1}/${ordered.length} ua${ui}`, String(url).slice(0, 100));
+      tabLog(
+        tabId,
+        'bg',
+        `尝试候选 ${i + 1}/${ordered.length}` +
+          (uaChain.length > 1 ? ` · UA#${ui}` : '') +
+          ` · clen=${formatBytes(getClen(url) || 0)}`
+      );
+      try {
+        const buffer = await fetchOne(url, ac.signal, sendProgress, ua, tabId);
         activeFetches.delete(tabId);
-        throw new Error('下载已取消');
+        tabLog(tabId, 'bg', `候选 #${i} 成功 · ${formatBytes(buffer.byteLength)}`);
+        return { mode: 'buffer', buffer, probes, usedIndex: i };
+      } catch (e) {
+        if (e.name === 'AbortError' || ac.signal.aborted) {
+          activeFetches.delete(tabId);
+          throw new Error('下载已取消');
+        }
+        lastErr = e;
+        log('fetch fail', e.message || e);
+        tabLog(tabId, 'bg', `候选 #${i} UA#${ui} 失败: ${e.message || e}`);
+        // 403/忽略 Range 换 UA；纯 network 也允许换 UA 再试同一 URL
+        if (/HTTP 403|HTTP 401|忽略 Range/i.test(e.message || '') && ui < uaChain.length - 1) {
+          continue;
+        }
+        if (isResumableErr(e) && ui < uaChain.length - 1) {
+          tabLog(tabId, 'bg', '同 URL 换 UA 再试');
+          continue;
+        }
+        break;
       }
-      lastErr = e;
-      log('fetch fail', e.message || e);
     }
   }
 
@@ -426,9 +881,14 @@ async function downloadWithFallback(urls, tabId, filename, sendProgress, userAge
     if (p.ok && list[i]) good.push(list[i]);
   });
 
+  if (good.length) {
+    tabLog(tabId, 'bg', `fetch 全挂 → chrome.downloads 兜底 ${good.length} 条`);
+  }
+
   for (let i = 0; i < good.length; i++) {
     const url = good[i];
     log(`try downloads ${i + 1}/${good.length}`, String(url).slice(0, 100));
+    tabLog(tabId, 'bg', `downloads API ${i + 1}/${good.length}`);
     try {
       sendProgress({ received: 0, total: 0, percent: 5 });
       const saved = await downloadsApiSave(url, filename);
@@ -438,10 +898,12 @@ async function downloadWithFallback(urls, tabId, filename, sendProgress, userAge
         total: saved.size,
         percent: 100
       });
+      tabLog(tabId, 'bg', `downloads 成功 · id=${saved.id} · ${formatBytes(saved.size)}`);
       return { mode: 'downloads', downloadId: saved.id, size: saved.size, probes };
     } catch (e) {
       lastErr = e;
       log('downloads fail', e.message || e);
+      tabLog(tabId, 'bg', `downloads 失败: ${e.message || e}`);
     }
   }
 
@@ -470,7 +932,7 @@ async function fetchConcatSegments(urls, tabId, sendProgress, userAgent) {
     const url = list[i];
     log(`concat ${i + 1}/${list.length}`, String(url).slice(0, 100));
     try {
-      const buf = await fetchOne(url, ac.signal, () => {}, userAgent);
+      const buf = await fetchOne(url, ac.signal, () => {}, userAgent, tabId);
       chunks.push(new Uint8Array(buf));
       received += buf.byteLength;
       sendProgress({
@@ -528,12 +990,109 @@ function makeThrottledProgress(tabId, step) {
   };
 }
 
+function pruneTransfers() {
+  const now = Date.now();
+  for (const [k, v] of pendingTransfers) {
+    if (now - (v.at || 0) > 15 * 60 * 1000) pendingTransfers.delete(k);
+  }
+}
+
+function storeTransfer(buffer, tabId) {
+  pruneTransfers();
+  const id = 't' + Date.now() + '_' + ++transferSeq;
+  const ab = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
+  pendingTransfers.set(id, { buffer: ab, tabId, at: Date.now() });
+  return id;
+}
+
+/** ArrayBuffer → base64（分段 fromCharCode，避免大 apply 爆栈） */
+function abToBase64(ab) {
+  const u8 = ab instanceof Uint8Array ? ab : new Uint8Array(ab);
+  const step = 0x8000;
+  let s = '';
+  for (let i = 0; i < u8.length; i += step) {
+    s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + step, u8.length)));
+  }
+  return btoa(s);
+}
+
+/**
+ * 不向 content 直传 ArrayBuffer（本环境会丢成空对象）。
+ * 只回传 chunked 元数据，content 再按片取 base64。
+ */
+function respondWithBuffer(sendResponse, buffer, extra = {}) {
+  const { tabId, ...rest } = extra;
+  const ab = buffer instanceof ArrayBuffer ? buffer : null;
+  const size = ab ? ab.byteLength : 0;
+  if (!ab || size <= 0) {
+    sendResponse({ ok: false, error: '空 buffer', ...rest });
+    return;
+  }
+  const transferId = storeTransfer(ab, tabId);
+  const chunkSize = TRANSFER_CHUNK;
+  const chunks = Math.ceil(size / chunkSize);
+  if (tabId != null) {
+    tabLog(
+      tabId,
+      'bg',
+      `回传 base64 分块 · ${formatBytes(size)} · ${chunks}×${formatBytes(chunkSize)} · id=${transferId}`
+    );
+  }
+  log('respond base64-chunked', transferId, formatBytes(size), chunks);
+  sendResponse({
+    ok: true,
+    mode: 'chunked',
+    encoding: 'base64',
+    transferId,
+    size,
+    chunkSize,
+    chunks,
+    ...rest
+  });
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
 
   if (msg.type === 'YT_DL_BG_ABORT') {
     const tabId = sender.tab?.id ?? msg.tabId;
     if (tabId != null) abortTab(tabId);
+    sendResponse({ ok: true });
+    return;
+  }
+
+  if (msg.type === 'YT_DL_BG_GET_CHUNK') {
+    const ent = pendingTransfers.get(msg.transferId);
+    if (!ent?.buffer) {
+      sendResponse({ ok: false, error: 'transfer 不存在或已释放' });
+      return;
+    }
+    const chunkSize = Number(msg.chunkSize) || TRANSFER_CHUNK;
+    const index = Number(msg.index) || 0;
+    const start = index * chunkSize;
+    if (start >= ent.buffer.byteLength) {
+      sendResponse({ ok: false, error: 'chunk index 越界' });
+      return;
+    }
+    const end = Math.min(ent.buffer.byteLength, start + chunkSize);
+    const slice = ent.buffer.slice(start, end);
+    try {
+      const data = abToBase64(slice);
+      sendResponse({
+        ok: true,
+        index,
+        encoding: 'base64',
+        data,
+        byteLength: slice.byteLength
+      });
+    } catch (e) {
+      sendResponse({ ok: false, error: 'base64 编码失败: ' + (e.message || e) });
+    }
+    return;
+  }
+
+  if (msg.type === 'YT_DL_BG_RELEASE') {
+    if (msg.transferId) pendingTransfers.delete(msg.transferId);
     sendResponse({ ok: true });
     return;
   }
@@ -573,10 +1132,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (result.ext === 'ts' && /\.mp4$/i.test(filename)) {
           filename = filename.replace(/\.mp4$/i, '.ts');
         }
-        sendResponse({
-          ok: true,
-          mode: 'buffer',
-          buffer: result.buffer,
+        respondWithBuffer(sendResponse, result.buffer, {
+          tabId,
           filename,
           mime: result.mime
         });
@@ -616,10 +1173,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           });
           return;
         }
-        sendResponse({
-          ok: true,
-          mode: 'buffer',
-          buffer: result.buffer,
+        respondWithBuffer(sendResponse, result.buffer, {
+          tabId,
           filename: msg.filename || 'youtube.mp4',
           usedIndex: result.usedIndex,
           probes: result.probes
@@ -628,6 +1183,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch((e) => {
         const error = e?.message || String(e);
         log('FETCH ERR', error);
+        tabLog(tabId, 'bg', `FETCH ERR: ${error}`);
         sendResponse({ ok: false, error });
       });
 

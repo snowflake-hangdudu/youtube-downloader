@@ -1774,6 +1774,18 @@
     };
   }
 
+  function expectedBytesFromFormat(format) {
+    const fromMeta = Number(format?.contentLength) || 0;
+    if (fromMeta > 1024) return fromMeta;
+    try {
+      const u = resolveFormatUrl(format)?.url || format?.url;
+      if (!u) return 0;
+      const clen = new URL(u).searchParams.get('clen');
+      if (clen && /^\d+$/.test(clen)) return Number(clen) || 0;
+    } catch (_) {}
+    return 0;
+  }
+
   function collectDownloadCandidates(format) {
     const itag = format?.itag;
     hydrateFormatUrl(format);
@@ -2318,7 +2330,9 @@
           videoOnlyFilename: base + '_video.mp4',
           userAgent: navigator.userAgent,
           itag: sniffPack.videoItag,
-          audioItag: sniffPack.audioItag
+          audioItag: sniffPack.audioItag,
+          videoExpectedBytes: 0,
+          audioExpectedBytes: 0
         };
       }
 
@@ -2351,7 +2365,8 @@
           urls: pack.urls,
           filename: base + '.mp4',
           userAgent: pack.userAgent || picked.video?._clientUA || null,
-          itag: picked.video?.itag || null
+          itag: picked.video?.itag || null,
+          videoExpectedBytes: expectedBytesFromFormat(picked.video)
         };
       }
 
@@ -2430,7 +2445,9 @@
           videoOnlyFilename: base + '_video.mp4',
           userAgent: videoPack.userAgent || video?._clientUA || null,
           itag: video?.itag || null,
-          audioItag: audio?.itag || null
+          audioItag: audio?.itag || null,
+          videoExpectedBytes: expectedBytesFromFormat(video),
+          audioExpectedBytes: expectedBytesFromFormat(audio)
         };
       }
 
@@ -2464,7 +2481,8 @@
               videoOnlyFilename: base + '_video.mp4',
               userAgent: videoPack.userAgent || video?._clientUA || null,
               audioItag: audio?.itag || null,
-              videoBytes: vBlob.size
+              videoBytes: vBlob.size,
+              audioExpectedBytes: expectedBytesFromFormat(audio)
             };
           }
           sendProgress('save', 100);
@@ -2485,7 +2503,9 @@
         videoOnlyFilename: base + '_video.mp4',
         userAgent: videoPack.userAgent || video?._clientUA || null,
         itag: video?.itag || null,
-        audioItag: audio?.itag || null
+        audioItag: audio?.itag || null,
+        videoExpectedBytes: expectedBytesFromFormat(video),
+        audioExpectedBytes: expectedBytesFromFormat(audio)
       };
     } finally {
       // bgFetch 时真正下载在 content/background，这里只重置准备态
@@ -2543,23 +2563,42 @@
           const pending = window.__YT_DL_PENDING_VIDEO__;
           if (!pending?.blob?.size) throw new Error('没有缓存的视频轨（可能已过期）');
           sendProgress('merge', 5);
+          log(
+            '合并',
+            `待合并视频 ${ (pending.blob.size / 1024 / 1024).toFixed(2)}MB + 音频 ${((e.data.audioBuffer?.byteLength || 0) / 1024 / 1024).toFixed(2)}MB`
+          );
           const aBlob = new Blob([e.data.audioBuffer], { type: 'audio/mp4' });
           const merged = await mergeM4sInPage(pending.blob, aBlob);
           sendProgress('save', 100);
-          saveBlob(merged, e.data.filename || pending.filename || 'youtube.mp4');
+          const outName = e.data.filename || pending.filename || 'youtube.mp4';
+          saveBlob(merged, outName);
           window.__YT_DL_PENDING_VIDEO__ = null;
-          log('下载', '待合并视频 + background 音频 完成');
-          reply(id, { type: 'OK', data: { merged: true, size: merged.size } });
+          log('下载', `待合并视频 + background 音频 完成 → ${outName} · ${(merged.size / 1024 / 1024).toFixed(2)}MB`);
+          reply(id, { type: 'OK', data: { merged: true, size: merged.size, filename: outName } });
           break;
         }
         case 'SAVE_PENDING_VIDEO': {
           const pending = window.__YT_DL_PENDING_VIDEO__;
+          if (e.data.clearOnly) {
+            window.__YT_DL_PENDING_VIDEO__ = null;
+            reply(id, { type: 'OK', data: { cleared: true } });
+            break;
+          }
           if (!pending?.blob?.size) throw new Error('没有缓存的视频轨');
-          sendProgress('save', 100);
-          saveBlob(pending.blob, e.data.filename || pending.videoOnlyFilename || 'video.mp4');
-          window.__YT_DL_PENDING_VIDEO__ = null;
-          log('下载', '仅保存视频轨（音频最终失败）');
-          reply(id, { type: 'OK', data: { videoOnly: true, size: pending.blob.size } });
+          const name = e.data.filename || pending.videoOnlyFilename || 'video.mp4';
+          saveBlob(pending.blob, name);
+          const keep = !!e.data.keep;
+          if (!keep) {
+            window.__YT_DL_PENDING_VIDEO__ = null;
+            sendProgress('save', 100);
+            log('下载', `仅保存视频轨（音频最终失败）→ ${name}`);
+          } else {
+            log('下载', `视频轨先落盘（保留内存待合并）→ ${name} · ${(pending.blob.size / 1024 / 1024).toFixed(2)}MB`);
+          }
+          reply(id, {
+            type: 'OK',
+            data: { videoOnly: !keep, size: pending.blob.size, kept: keep, filename: name }
+          });
           break;
         }
         case 'PAUSE_DOWNLOAD':
