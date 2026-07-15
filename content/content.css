@@ -65,6 +65,10 @@
   right: 0;
   width: 420px;
   max-width: calc(100vw - 32px);
+  /* 预留顶边距 + 悬浮按钮区，避免顶出视口 */
+  max-height: min(calc(100vh - 200px), 780px);
+  display: flex;
+  flex-direction: column;
   background: var(--ytd-surface);
   border: 1px solid var(--ytd-border);
   border-radius: 18px;
@@ -89,6 +93,7 @@
   padding: 14px 16px;
   background: linear-gradient(135deg, var(--ytd-header-from), var(--ytd-header-to));
   color: #fff;
+  flex-shrink: 0;
 }
 
 .yt-dl-header-left {
@@ -138,8 +143,10 @@
 .yt-dl-body {
   padding: 14px 16px 16px;
   background: var(--ytd-bg);
-  max-height: min(78vh, 720px);
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .yt-dl-debug {
@@ -424,6 +431,65 @@
 
 .yt-dl-tabs.hidden {
   display: none;
+}
+
+.yt-dl-tab.hidden {
+  display: none;
+}
+
+.yt-dl-links-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ytd-text);
+}
+
+.yt-dl-links-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 72px;
+  max-height: 160px;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--ytd-border);
+  border-radius: 12px;
+  background: var(--ytd-surface);
+  color: var(--ytd-text);
+  font-size: 12px;
+  line-height: 1.5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.yt-dl-links-input:focus {
+  outline: none;
+  border-color: var(--ytd-primary);
+  box-shadow: 0 0 0 3px rgba(119, 40, 46, 0.12);
+}
+
+.yt-dl-links-meta {
+  font-weight: 600;
+  color: var(--ytd-primary);
+}
+
+.yt-dl-links-clear {
+  border: 1px solid var(--ytd-border);
+  border-radius: 999px;
+  background: var(--ytd-surface);
+  color: var(--ytd-text-muted);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.yt-dl-links-clear:hover {
+  border-color: var(--ytd-primary);
+  color: var(--ytd-primary);
+}
+
+.yt-dl-links-list {
+  max-height: 140px;
 }
 
 .yt-dl-tab {
@@ -909,6 +975,7 @@
   border-top: 1px solid var(--ytd-border);
   font-size: 10px;
   color: var(--ytd-text-muted);
+  flex-shrink: 0;
 }
 
 .yt-dl-footer-text {

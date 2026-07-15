@@ -510,16 +510,19 @@
       view = Number(vd.viewCount) || 0;
     }
 
-    // DOM / Open Graph 兜底（不依赖 player 对象）
-    if (!title) {
+    // DOM / Open Graph 兜底：仅当目标就是当前页，否则会串成别的片名
+    const pageId = parseVideoId(location.href)?.videoId;
+    const onCurrentPage = !pageId || pageId === videoId;
+
+    if (!title && onCurrentPage) {
       title =
         metaContent('meta[property="og:title"]') ||
         metaContent('meta[name="title"]') ||
         document.querySelector('h1.ytd-watch-metadata yt-formatted-string')?.textContent?.trim() ||
         document.title.replace(/\s*-\s*YouTube\s*$/i, '').trim() ||
-        videoId;
+        '';
     }
-    if (!author) {
+    if (!author && onCurrentPage) {
       author =
         document.querySelector('#channel-name a')?.textContent?.trim() ||
         document.querySelector('ytd-channel-name a')?.textContent?.trim() ||
@@ -527,11 +530,11 @@
         '';
     }
     if (!pic) {
-      pic =
-        metaContent('meta[property="og:image"]') ||
-        pickThumb(null, videoId);
+      pic = onCurrentPage
+        ? metaContent('meta[property="og:image"]') || pickThumb(null, videoId)
+        : pickThumb(null, videoId);
     }
-    if (!view) {
+    if (!view && onCurrentPage) {
       const viewText =
         document.querySelector('ytd-watch-info-text #tooltip')?.textContent ||
         document.querySelector('#info-container ytd-watch-info-text')?.textContent ||
@@ -545,7 +548,15 @@
       }
     }
 
-    log('解析', `${videoId} · ${title.slice(0, 40)}${prOk ? '' : '（DOM兜底）'}`);
+    // 非当前页且还没有标题：走独立元数据解析（InnerTube / oEmbed）
+    if (!title && !onCurrentPage) {
+      try {
+        return await resolveVideoMeta(videoId);
+      } catch (_) {}
+    }
+    if (!title) title = videoId;
+
+    log('解析', `${videoId} · ${title.slice(0, 40)}${prOk ? '' : onCurrentPage ? '（DOM兜底）' : '（异页）'}`);
 
     return {
       videoId,
@@ -560,7 +571,7 @@
       pubdate: 0,
       duration,
       pages: [{ page: 1, part: title, cid: videoId }],
-      source: prOk ? 'playerResponse' : 'dom'
+      source: prOk ? 'playerResponse' : onCurrentPage ? 'dom' : 'remote'
     };
   }
 
@@ -952,6 +963,87 @@
       );
     }
     return json;
+  }
+
+  /** 按 videoId 解析标题等（不依赖当前打开页；供多链接/队列用） */
+  async function resolveVideoMeta(videoId) {
+    const id = String(videoId || '').trim();
+    if (!/^[a-zA-Z0-9_-]{11}$/.test(id)) throw new Error('无效 videoId');
+
+    const pageId = parseVideoId(location.href)?.videoId;
+    if (pageId === id) {
+      return resolveVideo(location.href, 0);
+    }
+
+    const preferKeys = ['web_page', 'android_vr', 'mweb', 'web_safari'];
+    for (const key of preferKeys) {
+      const preset = INNERTUBE_CLIENTS.find((c) => c.key === key);
+      if (!preset) continue;
+      try {
+        const pr = await fetchInnertubePlayer(id, preset);
+        const vd = pr?.videoDetails;
+        if (vd?.title) {
+          const title = String(vd.title);
+          log('元数据', `${id} · ${title.slice(0, 40)} · ${preset.key}`);
+          return {
+            videoId: id,
+            bvid: id,
+            aid: id,
+            cid: id,
+            title,
+            author: vd.author || '',
+            pic: pickThumb(vd.thumbnail?.thumbnails, id),
+            view: Number(vd.viewCount) || 0,
+            pubdate: 0,
+            duration: Number(vd.lengthSeconds) || 0,
+            pages: [{ page: 1, part: title, cid: id }],
+            source: 'innertube:' + preset.key
+          };
+        }
+      } catch (_) {}
+    }
+
+    try {
+      const oembedUrl =
+        'https://www.youtube.com/oembed?format=json&url=' +
+        encodeURIComponent('https://www.youtube.com/watch?v=' + id);
+      const res = await fetch(oembedUrl, { credentials: 'omit' });
+      if (res.ok) {
+        const j = await res.json();
+        const title = String(j.title || id);
+        log('元数据', `${id} · ${title.slice(0, 40)} · oembed`);
+        return {
+          videoId: id,
+          bvid: id,
+          aid: id,
+          cid: id,
+          title,
+          author: j.author_name || '',
+          pic: j.thumbnail_url || pickThumb(null, id),
+          view: 0,
+          pubdate: 0,
+          duration: 0,
+          pages: [{ page: 1, part: title, cid: id }],
+          source: 'oembed'
+        };
+      }
+    } catch (_) {}
+
+    log('元数据', `${id} · 失败，回退用 ID`);
+    return {
+      videoId: id,
+      bvid: id,
+      aid: id,
+      cid: id,
+      title: id,
+      author: '',
+      pic: pickThumb(null, id),
+      view: 0,
+      pubdate: 0,
+      duration: 0,
+      pages: [{ page: 1, part: id, cid: id }],
+      source: 'fallback'
+    };
   }
 
   function resolveUrl(base, rel) {
@@ -3012,6 +3104,12 @@
           break;
         case 'RESOLVE_VIDEO':
           reply(id, { type: 'OK', data: { info: await resolveVideo(e.data.href, e.data.pageIndex || 0) } });
+          break;
+        case 'RESOLVE_VIDEO_META':
+          reply(id, {
+            type: 'OK',
+            data: { info: await resolveVideoMeta(e.data.videoId || e.data.aid || e.data.cid) }
+          });
           break;
         case 'GET_PLAYLIST':
           reply(id, { type: 'OK', data: await getPlaylist(e.data.href || location.href) });

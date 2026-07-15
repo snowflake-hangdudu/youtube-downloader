@@ -86,6 +86,7 @@
 | 功能范围 | 普通 **watch / Shorts** 保存；**不**破解会员/DRM/年龄门绕过 |
 | 成品格式 | **有声单文件**：H.264→`.mp4`，或 VP9+Opus→`.webm`；文件名带清晰度 |
 | 播放列表 | URL 带 `list=` 时显示「播放列表」Tab；可勾选条目 **串行队列**下载（用当前清晰度） |
+| 多链接 | 常驻「多链接」Tab：粘贴多条 URL（换行/空格/逗号），识别 videoId 后串行队列 |
 | 下载 UI | 进度条（真实字节 + 阶段）；暂停/继续/取消（合并阶段隐藏暂停） |
 | 清晰度 | 以可访问 URL / HLS / 嗅探为准；WEB SABR 无 url **不造假档**；可用时标 `·WebM` / `↓` |
 | 合并失败兜底 | **分别保存**音视频轨，避免重下几百 MB（见 §6.6） |
@@ -171,6 +172,7 @@ const AGENT = 'yt-dl-agent';  // page-agent 发出
 |------|------|
 | `START_DOWNLOAD` | 返回 `bgFetch` / `container` / `actualQn` / `filename` 等，见 §11 |
 | `GET_PLAYLIST` | URL 有 `list=` 时返回 `{ inPlaylist, playlistId, title, items[] }` |
+| `RESOLVE_VIDEO_META` | 按 videoId 取标题/作者（多链接队列用，不依赖当前页） |
 | `MERGE_BUFFERS` | `videoBuffer`+`audioBuffer`+`filename`；成功 `{ blob }`；失败可 `{ savedTracks: true, videoName, audioName }` |
 | `MERGE_PENDING_VIDEO` | 合并 `__YT_DL_PENDING_VIDEO__`；同样支持分轨兜底 |
 | `SAVE_PENDING_VIDEO` | 仅存无声视频 |
@@ -504,6 +506,7 @@ python scripts/gen_store_assets.py
 | 低 | Cues/ Seek 索引 | WebM remux 暂可不写 Cues（可播，Seek 略慢） |
 | 低 | Edge 上架 / 独立图标 | 搁置 |
 | ✅ | 播放列表 Tab + 队列 | URL `list=` 时显示；串行下选中项；续页加载待加强 |
+| ✅ | 多链接 Tab + 队列 | 粘贴 URL/ID；去重后串行下载 |
 
 ---
 
