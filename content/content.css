@@ -412,6 +412,147 @@
   display: none;
 }
 
+.yt-dl-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 3px;
+  border-radius: 12px;
+  background: var(--ytd-surface);
+  border: 1px solid var(--ytd-border);
+}
+
+.yt-dl-tabs.hidden {
+  display: none;
+}
+
+.yt-dl-tab {
+  flex: 1;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ytd-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.yt-dl-tab:hover {
+  color: var(--ytd-primary);
+}
+
+.yt-dl-tab.active {
+  background: var(--ytd-primary);
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(119, 40, 46, 0.28);
+}
+
+.yt-dl-tab-panel.hidden {
+  display: none;
+}
+
+.yt-dl-pl-meta {
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ytd-text);
+  line-height: 1.4;
+}
+
+.yt-dl-pl-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: var(--ytd-text-muted);
+}
+
+.yt-dl-pl-checkall {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.yt-dl-pl-count {
+  font-weight: 600;
+  color: var(--ytd-primary);
+}
+
+.yt-dl-pl-list {
+  max-height: 220px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+  border: 1px solid var(--ytd-border);
+  border-radius: 12px;
+  background: var(--ytd-surface);
+}
+
+.yt-dl-pl-empty {
+  padding: 16px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--ytd-text-muted);
+}
+
+.yt-dl-pl-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--ytd-border);
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ytd-text);
+}
+
+.yt-dl-pl-row:last-child {
+  border-bottom: none;
+}
+
+.yt-dl-pl-row:hover {
+  background: var(--ytd-primary-soft);
+}
+
+.yt-dl-pl-row.is-current {
+  background: var(--ytd-primary-soft);
+}
+
+.yt-dl-pl-idx {
+  flex-shrink: 0;
+  min-width: 18px;
+  font-size: 10px;
+  color: var(--ytd-text-muted);
+  text-align: right;
+}
+
+.yt-dl-pl-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+
+.yt-dl-pl-dur {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--ytd-text-muted);
+}
+
+.yt-dl-pl-tip {
+  margin: 0 0 10px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ytd-text-muted);
+}
+
 .yt-dl-page-btn {
   padding: 4px 10px;
   border: 1px solid var(--ytd-border);

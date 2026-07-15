@@ -339,10 +339,20 @@
   let downloadSeq = 0;
   let queueRunning = false;
   let queueCancelled = false;
+  let playlistInfo = null;
+  let activeTab = 'current';
 
   /** YouTube view API：pages.length > 1 且每 P 有 cid 才是真·多 P */
   function isMultiPartVideo(pages) {
     return Array.isArray(pages) && pages.length > 1 && pages.every((p) => p && p.cid);
+  }
+
+  function urlHasPlaylist(href) {
+    try {
+      return !!new URL(href || location.href).searchParams.get('list');
+    } catch {
+      return false;
+    }
   }
 
   window.addEventListener('message', (e) => {
@@ -423,6 +433,12 @@
               </div>
             </div>
 
+            <div id="yt-dl-tabs" class="yt-dl-tabs hidden">
+              <button type="button" class="yt-dl-tab active" data-tab="current">当前视频</button>
+              <button type="button" class="yt-dl-tab" data-tab="playlist" id="yt-dl-tab-playlist">播放列表</button>
+            </div>
+
+            <div id="yt-dl-panel-current" class="yt-dl-tab-panel">
             <div id="yt-dl-pages" class="yt-dl-pages hidden"></div>
 
             <div class="yt-dl-section">
@@ -455,6 +471,22 @@
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
               <span id="yt-dl-queue-label">队列下载全部分 P</span>
             </button>
+            </div>
+
+            <div id="yt-dl-panel-playlist" class="yt-dl-tab-panel hidden">
+              <div id="yt-dl-pl-meta" class="yt-dl-pl-meta">加载播放列表…</div>
+              <div class="yt-dl-pl-toolbar">
+                <label class="yt-dl-pl-checkall"><input type="checkbox" id="yt-dl-pl-checkall" checked> 全选</label>
+                <span id="yt-dl-pl-count" class="yt-dl-pl-count">0 / 0</span>
+              </div>
+              <div id="yt-dl-pl-list" class="yt-dl-pl-list"></div>
+              <p class="yt-dl-pl-tip">队列将使用「当前视频」页所选清晰度；无匹配档时自动降档。</p>
+              <button id="yt-dl-pl-queue" type="button" class="yt-dl-btn" disabled>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+                <span id="yt-dl-pl-queue-label">队列下载选中</span>
+              </button>
+            </div>
+
             <div id="yt-dl-progress" class="yt-dl-progress hidden">
               <div class="yt-dl-progress-meta">
                 <span id="yt-dl-progress-title" class="yt-dl-progress-title"></span>
@@ -513,6 +545,16 @@
     const authorEl = panel.querySelector('#yt-dl-video-author');
     const subEl = panel.querySelector('#yt-dl-video-sub');
     const pagesEl = panel.querySelector('#yt-dl-pages');
+    const tabsEl = panel.querySelector('#yt-dl-tabs');
+    const tabPlaylistBtn = panel.querySelector('#yt-dl-tab-playlist');
+    const panelCurrent = panel.querySelector('#yt-dl-panel-current');
+    const panelPlaylist = panel.querySelector('#yt-dl-panel-playlist');
+    const plMetaEl = panel.querySelector('#yt-dl-pl-meta');
+    const plListEl = panel.querySelector('#yt-dl-pl-list');
+    const plCheckAll = panel.querySelector('#yt-dl-pl-checkall');
+    const plCountEl = panel.querySelector('#yt-dl-pl-count');
+    const plQueueBtn = panel.querySelector('#yt-dl-pl-queue');
+    const plQueueLabel = panel.querySelector('#yt-dl-pl-queue-label');
     const pillsEl = panel.querySelector('#yt-dl-quality-pills');
     const maxLabelEl = panel.querySelector('#yt-dl-max-label');
     const estimateEl = panel.querySelector('#yt-dl-estimate');
@@ -542,6 +584,116 @@
     function setQueueLabel(count) {
       queueLabelEl.textContent = count > 1 ? `队列下载全部 ${count} 个分 P` : '队列下载全部分 P';
     }
+
+    function setActiveTab(name) {
+      activeTab = name === 'playlist' ? 'playlist' : 'current';
+      tabsEl.querySelectorAll('.yt-dl-tab').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.tab === activeTab);
+      });
+      panelCurrent.classList.toggle('hidden', activeTab !== 'current');
+      panelPlaylist.classList.toggle('hidden', activeTab !== 'playlist');
+    }
+
+    function getSelectedPlaylistItems() {
+      if (!playlistInfo?.items?.length) return [];
+      const boxes = plListEl.querySelectorAll('input.yt-dl-pl-item[type="checkbox"]');
+      const selected = new Set();
+      boxes.forEach((box) => {
+        if (box.checked) selected.add(box.dataset.vid);
+      });
+      return playlistInfo.items.filter((it) => selected.has(it.videoId));
+    }
+
+    function updatePlaylistSelectionUi() {
+      const all = playlistInfo?.items || [];
+      const picked = getSelectedPlaylistItems();
+      plCountEl.textContent = `${picked.length} / ${all.length}`;
+      plCheckAll.checked = all.length > 0 && picked.length === all.length;
+      plCheckAll.indeterminate = picked.length > 0 && picked.length < all.length;
+      plQueueBtn.disabled = !picked.length || !selectedQn || queueRunning || downloading;
+      plQueueLabel.textContent =
+        picked.length > 0 ? `队列下载选中 (${picked.length})` : '队列下载选中';
+    }
+
+    function renderPlaylistPanel(pl) {
+      playlistInfo = pl;
+      if (!pl?.inPlaylist) {
+        tabsEl.classList.add('hidden');
+        setActiveTab('current');
+        plMetaEl.textContent = '';
+        plListEl.innerHTML = '';
+        updatePlaylistSelectionUi();
+        return;
+      }
+
+      tabsEl.classList.remove('hidden');
+      const shown = pl.items?.length || 0;
+      const total = pl.totalVideos || shown;
+      tabPlaylistBtn.textContent = total > shown ? `播放列表 · ${shown}+` : `播放列表 · ${shown}`;
+      plMetaEl.textContent = pl.title
+        ? `${pl.title}${total ? ` · 共 ${total} 条` : ''}${pl.hint ? ' · ' + pl.hint : ''}`
+        : pl.hint || '播放列表';
+
+      if (!pl.items?.length) {
+        plListEl.innerHTML = `<div class="yt-dl-pl-empty">${pl.hint || '暂无条目'}</div>`;
+        updatePlaylistSelectionUi();
+        return;
+      }
+
+      const currentId = videoInfo?.videoId || videoInfo?.aid || '';
+      plListEl.innerHTML = pl.items
+        .map((it) => {
+          const cur = it.videoId === currentId ? ' is-current' : '';
+          const dur = it.duration ? `<span class="yt-dl-pl-dur">${it.duration}</span>` : '';
+          return `<label class="yt-dl-pl-row${cur}">
+            <input type="checkbox" class="yt-dl-pl-item" data-vid="${it.videoId}" checked>
+            <span class="yt-dl-pl-idx">${it.index || ''}</span>
+            <span class="yt-dl-pl-title" title="${String(it.title || '').replace(/"/g, '&quot;')}">${it.title || it.videoId}</span>
+            ${dur}
+          </label>`;
+        })
+        .join('');
+
+      plListEl.querySelectorAll('input.yt-dl-pl-item').forEach((box) => {
+        box.addEventListener('change', updatePlaylistSelectionUi);
+      });
+      updatePlaylistSelectionUi();
+    }
+
+    async function loadPlaylistInfo() {
+      if (!urlHasPlaylist(location.href)) {
+        renderPlaylistPanel({ inPlaylist: false, items: [] });
+        return;
+      }
+      plMetaEl.textContent = '加载播放列表…';
+      try {
+        const pl = await agentCall('GET_PLAYLIST', { href: location.href });
+        renderPlaylistPanel(pl);
+        debugLog(
+          '播放列表',
+          `${pl.source || '?'} · ${pl.items?.length || 0}/${pl.totalVideos || 0} · ${pl.title || ''}`
+        );
+      } catch (err) {
+        renderPlaylistPanel({
+          inPlaylist: true,
+          title: '播放列表',
+          items: [],
+          hint: err.message || '加载失败'
+        });
+        debugLog('播放列表', '失败: ' + (err.message || err));
+      }
+    }
+
+    tabsEl.querySelectorAll('.yt-dl-tab').forEach((btn) => {
+      btn.addEventListener('click', () => setActiveTab(btn.dataset.tab));
+    });
+    plCheckAll.addEventListener('change', () => {
+      const on = plCheckAll.checked;
+      plListEl.querySelectorAll('input.yt-dl-pl-item').forEach((box) => {
+        box.checked = on;
+      });
+      updatePlaylistSelectionUi();
+    });
 
     function appendDebugLine(step, msg) {
       const t = new Date();
@@ -613,7 +765,8 @@
       merge: '合并音视频',
       save: '保存文件',
       paused: '已暂停',
-      queue: '分 P 队列下载'
+      queue: '分 P 队列下载',
+      playlist: '播放列表队列'
     };
 
     function formatBytes(n) {
@@ -797,6 +950,7 @@
       if (!qualities.length) {
         pillsEl.innerHTML = '<span class="yt-dl-pill disabled">无可用清晰度</span>';
         selectedQn = 0;
+        updatePlaylistSelectionUi();
         return;
       }
       if (!qualities.some((q) => q.qn === selectedQn)) {
@@ -811,9 +965,11 @@
           pillsEl.querySelectorAll('.yt-dl-pill').forEach((b) => b.classList.remove('active'));
           btn.classList.add('active');
           refreshEstimate();
+          updatePlaylistSelectionUi();
         };
       });
       refreshEstimate();
+      updatePlaylistSelectionUi();
     }
 
     async function fetchSnapshot() {
@@ -840,6 +996,9 @@
       startBtn.disabled = true;
       statusEl.classList.add('hidden');
       pillsEl.innerHTML = '<span class="yt-dl-pill loading">加载中</span>';
+      if (!urlHasPlaylist(location.href)) {
+        renderPlaylistPanel({ inPlaylist: false, items: [] });
+      }
 
       try {
         const snap = await fetchSnapshot();
@@ -906,8 +1065,10 @@
           setupMuxInPage().catch(() => {});
         }
         startBtn.disabled = !snap.qualities.length;
+        updatePlaylistSelectionUi();
 
         debugLog('加载', `${videoInfo.aid}/${videoInfo.cid} · ${snap.qualities.map((q) => q.label).join(', ')}`);
+        loadPlaylistInfo();
       } catch (err) {
         setDetect('识别失败', false);
         setVideoLoading(false);
@@ -1334,6 +1495,7 @@
       downloading = true;
       startBtn.disabled = true;
       queueBtn.disabled = true;
+      plQueueBtn.disabled = true;
       startBtn.textContent = '下载中…';
       statusEl.classList.add('hidden');
 
@@ -1341,6 +1503,7 @@
         downloading = false;
         startBtn.disabled = false;
         queueBtn.disabled = false;
+        updatePlaylistSelectionUi();
         startBtn.innerHTML = btnDefaultHtml;
         return;
       }
@@ -1400,7 +1563,80 @@
         startBtn.disabled = false;
         queueBtn.disabled = false;
         startBtn.innerHTML = btnDefaultHtml;
+        updatePlaylistSelectionUi();
       }
+    }
+
+    async function startPlaylistQueueDownload() {
+      const items = getSelectedPlaylistItems();
+      if (!selectedQn || !items.length || queueRunning || downloading) return;
+      if (!(await ensureMuxReady())) return;
+
+      const total = items.length;
+      queueRunning = true;
+      queueCancelled = false;
+      startBtn.disabled = true;
+      queueBtn.disabled = true;
+      plQueueBtn.disabled = true;
+      plQueueLabel.textContent = '队列下载中…';
+      statusEl.classList.add('hidden');
+      setActiveTab('playlist');
+
+      let ok = 0;
+      let fail = 0;
+      const seq = ++downloadSeq;
+      debugLog('播放列表', `──── #${seq} 队列开始 · ${total} 条 · ${selectedQn}P ────`);
+
+      for (let i = 0; i < total; i++) {
+        if (queueCancelled) break;
+        const it = items[i];
+        const partInfo = {
+          videoId: it.videoId,
+          bvid: it.videoId,
+          aid: it.videoId,
+          cid: it.videoId,
+          title: it.title || it.videoId,
+          author: it.author || '',
+          pages: [{ page: 1, part: it.title || it.videoId, cid: it.videoId }]
+        };
+
+        downloading = true;
+        resetPauseUI();
+        progressEl.classList.remove('hidden');
+        setProgressActionsVisible(true);
+        progressTitle.textContent = `${i + 1}/${total} · ${partInfo.title}`;
+        progressTitle.title = partInfo.title;
+        progressQ.textContent = getSelectedQualityLabel();
+        updateProgress('playlist', Math.round((i / total) * 100));
+        debugLog('播放列表', `#${i + 1}/${total} ${it.videoId} · ${partInfo.title.slice(0, 40)}`);
+
+        try {
+          await runSingleDownload(partInfo);
+          ok++;
+        } catch (err) {
+          if (err.message === '下载已取消' || queueCancelled) break;
+          fail++;
+          debugLog('播放列表', `#${i + 1} 失败: ${err.message}`);
+        }
+      }
+
+      hideProgress();
+      queueRunning = false;
+      downloading = false;
+
+      if (queueCancelled) {
+        showStatus('error', `播放列表队列已取消（已完成 ${ok}/${total}）`);
+      } else if (fail === 0) {
+        showStatus('success', `播放列表下载完成，共 ${ok} 个视频`);
+      } else {
+        showErrorWithFaq(`部分完成：成功 ${ok}，失败 ${fail}`, 'parts');
+      }
+      debugLog('播放列表', `──── #${seq} 队列结束 · 成功 ${ok} · 失败 ${fail} ────`);
+
+      startBtn.disabled = false;
+      queueBtn.disabled = false;
+      startBtn.innerHTML = btnDefaultHtml;
+      updatePlaylistSelectionUi();
     }
 
     async function startQueueDownload() {
@@ -1412,6 +1648,7 @@
       queueCancelled = false;
       startBtn.disabled = true;
       queueBtn.disabled = true;
+      plQueueBtn.disabled = true;
       queueLabelEl.textContent = '队列下载中…';
       statusEl.classList.add('hidden');
 
@@ -1452,6 +1689,7 @@
 
       hideProgress();
       queueRunning = false;
+      downloading = false;
 
       if (queueCancelled) {
         showStatus('error', `队列已取消（已完成 ${ok}/${total}）`);
@@ -1465,6 +1703,7 @@
       startBtn.disabled = false;
       setQueueLabel(total);
       startBtn.innerHTML = btnDefaultHtml;
+      updatePlaylistSelectionUi();
     }
 
     toggleBtn.onclick = async () => {
@@ -1475,6 +1714,7 @@
     closeBtn.onclick = () => { isOpen = false; menu.classList.add('hidden'); };
     startBtn.onclick = startDownload;
     queueBtn.onclick = startQueueDownload;
+    plQueueBtn.onclick = startPlaylistQueueDownload;
 
     panel.querySelector('.yt-dl-feedback')?.addEventListener('click', () => {
       navigator.clipboard?.writeText('748604487').catch(() => {});
@@ -1491,6 +1731,8 @@
         pageIndex = 0;
         videoInfo = null;
         selectedQn = 0;
+        playlistInfo = null;
+        setActiveTab('current');
         if (isOpen) loadVideoInfo();
       }
     };

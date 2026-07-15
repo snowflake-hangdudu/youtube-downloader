@@ -214,6 +214,223 @@
     }
   }
 
+  /** URL 含 list= 即视为播放列表上下文（含 PL / RD mix 等） */
+  function parsePlaylistId(href) {
+    try {
+      const u = new URL(href || location.href);
+      const list = u.searchParams.get('list');
+      return list ? String(list) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function textFromRuns(obj) {
+    if (!obj) return '';
+    if (typeof obj === 'string') return obj;
+    if (obj.simpleText) return String(obj.simpleText);
+    if (Array.isArray(obj.runs)) return obj.runs.map((r) => r.text || '').join('');
+    return '';
+  }
+
+  function collectPlaylistItemsFromContents(contents) {
+    const items = [];
+    const seen = new Set();
+    for (const c of contents || []) {
+      const r = c?.playlistPanelVideoRenderer || c?.playlistVideoRenderer;
+      if (!r?.videoId || seen.has(r.videoId)) continue;
+      seen.add(r.videoId);
+      items.push({
+        videoId: r.videoId,
+        title: textFromRuns(r.title) || r.videoId,
+        index: Number(textFromRuns(r.index)) || items.length + 1,
+        duration: textFromRuns(r.lengthText) || '',
+        selected: !!r.selected,
+        author: textFromRuns(r.shortBylineText) || ''
+      });
+    }
+    return items;
+  }
+
+  function extractPlaylistFromYtInitialData() {
+    try {
+      const data = window.ytInitialData;
+      const pl = data?.contents?.twoColumnWatchNextResults?.playlist?.playlist;
+      if (!pl) return null;
+      const items = collectPlaylistItemsFromContents(pl.contents);
+      if (!items.length) return null;
+      return {
+        playlistId: pl.playlistId || parsePlaylistId(location.href),
+        title: textFromRuns(pl.title) || pl.title || '播放列表',
+        totalVideos: Number(pl.totalVideos) || items.length,
+        items,
+        source: 'ytInitialData'
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function extractPlaylistFromDom() {
+    const root =
+      document.querySelector('ytd-playlist-panel-renderer') ||
+      document.querySelector('#playlist');
+    if (!root) return null;
+    const title =
+      root.querySelector('#title')?.textContent?.trim() ||
+      root.querySelector('h3 a')?.textContent?.trim() ||
+      '播放列表';
+    const rows = root.querySelectorAll(
+      'ytd-playlist-panel-video-renderer, ytd-playlist-video-renderer'
+    );
+    const items = [];
+    const seen = new Set();
+    rows.forEach((el, i) => {
+      const a = el.querySelector('a#wc-endpoint, a#thumbnail, a[href*="watch"]');
+      const href = a?.getAttribute('href') || '';
+      let videoId = '';
+      try {
+        videoId = new URL(href, location.origin).searchParams.get('v') || '';
+      } catch (_) {}
+      if (!videoId || seen.has(videoId)) return;
+      seen.add(videoId);
+      const t =
+        el.querySelector('#video-title')?.textContent?.trim() ||
+        el.querySelector('#meta h4')?.textContent?.trim() ||
+        videoId;
+      const dur =
+        el.querySelector('span.ytd-thumbnail-overlay-time-status-renderer')?.textContent?.trim() ||
+        '';
+      items.push({
+        videoId,
+        title: t,
+        index: i + 1,
+        duration: dur,
+        selected: el.hasAttribute('selected') || el.classList.contains('selected'),
+        author: ''
+      });
+    });
+    if (!items.length) return null;
+    return {
+      playlistId: parsePlaylistId(location.href),
+      title,
+      totalVideos: items.length,
+      items,
+      source: 'dom'
+    };
+  }
+
+  async function fetchInnertubeNextPlaylist(videoId, playlistId) {
+    if (!playlistId) return null;
+    const { apiKey, visitorData, context: pageCtx } = readYtcfg();
+    const key = apiKey || 'AIzaSyA8eiZmM1FaDVjRy1bhOY3dPt5iiza21MY';
+    const pageClient = pageCtx?.client || {};
+    const context = pageCtx
+      ? {
+          ...pageCtx,
+          client: {
+            ...pageClient,
+            clientName: pageClient.clientName || 'WEB',
+            clientVersion: pageClient.clientVersion || '2.20260708.00.00',
+            visitorData: visitorData || pageClient.visitorData
+          }
+        }
+      : {
+          client: {
+            clientName: 'WEB',
+            clientVersion: '2.20260708.00.00',
+            hl: 'zh-CN',
+            gl: 'CN',
+            visitorData: visitorData || undefined
+          }
+        };
+
+    const body = {
+      context,
+      playlistId,
+      ...(videoId ? { videoId } : {})
+    };
+
+    const url =
+      'https://www.youtube.com/youtubei/v1/next?prettyPrint=false&key=' +
+      encodeURIComponent(key);
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-YouTube-Client-Name': '1',
+      'X-YouTube-Client-Version': context.client?.clientVersion || ''
+    };
+    if (context.client?.visitorData) headers['X-Goog-Visitor-Id'] = context.client.visitorData;
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      credentials: 'include'
+    });
+    if (!res.ok) {
+      log('播放列表', `next HTTP ${res.status}`);
+      return null;
+    }
+    const json = await res.json();
+    const pl = json?.contents?.twoColumnWatchNextResults?.playlist?.playlist;
+    if (!pl) {
+      log('播放列表', 'next 无 playlist 面板');
+      return null;
+    }
+    const items = collectPlaylistItemsFromContents(pl.contents);
+    log('播放列表', `next · ${items.length} 条 · ${textFromRuns(pl.title) || playlistId}`);
+    return {
+      playlistId: pl.playlistId || playlistId,
+      title: textFromRuns(pl.title) || pl.title || '播放列表',
+      totalVideos: Number(pl.totalVideos) || items.length,
+      items,
+      source: 'innertube_next'
+    };
+  }
+
+  /**
+   * 获取当前页所属播放列表条目。
+   * 仅当 URL 带 list= 时返回 inPlaylist=true；条目优先页内数据，失败再走 next。
+   */
+  async function getPlaylist(href) {
+    const playlistId = parsePlaylistId(href || location.href);
+    if (!playlistId) {
+      return { inPlaylist: false, playlistId: null, title: '', totalVideos: 0, items: [], source: null };
+    }
+    const videoId = parseVideoId(href || location.href)?.videoId || '';
+
+    let info = extractPlaylistFromYtInitialData();
+    if (!info?.items?.length) info = extractPlaylistFromDom();
+    if (!info?.items?.length) {
+      try {
+        info = await fetchInnertubeNextPlaylist(videoId, playlistId);
+      } catch (e) {
+        log('播放列表', 'next 失败: ' + (e?.message || e));
+      }
+    }
+
+    if (!info?.items?.length) {
+      return {
+        inPlaylist: true,
+        playlistId,
+        title: '播放列表',
+        totalVideos: 0,
+        items: [],
+        source: 'empty',
+        hint: '未能读取播放列表条目，请打开右侧播放列表面板后重试'
+      };
+    }
+
+    return {
+      inPlaylist: true,
+      playlistId: info.playlistId || playlistId,
+      title: info.title || '播放列表',
+      totalVideos: info.totalVideos || info.items.length,
+      items: info.items,
+      source: info.source || 'unknown'
+    };
+  }
+
   /**
    * 获取 playerResponse（按可靠度排序）
    * 1) #movie_player.getPlayerResponse() — SPA 切视频后也准
@@ -2795,6 +3012,9 @@
           break;
         case 'RESOLVE_VIDEO':
           reply(id, { type: 'OK', data: { info: await resolveVideo(e.data.href, e.data.pageIndex || 0) } });
+          break;
+        case 'GET_PLAYLIST':
+          reply(id, { type: 'OK', data: await getPlaylist(e.data.href || location.href) });
           break;
         case 'GET_QUALITIES':
           reply(id, { type: 'OK', data: await getQualities(e.data.aid, e.data.cid) });
