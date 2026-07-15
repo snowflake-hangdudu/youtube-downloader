@@ -28,7 +28,7 @@
 | postMessage | `bili-dl-panel` / `bili-dl-agent` | `yt-dl-panel` / `yt-dl-agent` |
 | popup API | `__BILI_DL_API__` / `BILI_DL_*` | `__YT_DL_API__` / `YT_DL_*` |
 | 匹配页 | `/video/BV…` | `/watch?v=`、`/shorts/` |
-| CSS 变量 | `--bdl-*` | `--ytd-*`（主色红 `#dc2626`） |
+| CSS 变量 | `--bdl-*` | `--ytd-*`（媚红 `#77282E` · 白雪 `#D6D4E2`） |
 | CDN 下载 | **必须** MAIN world（后台 403） | **优先 background** Range 并行拉 googlevideo；MAIN 负责解析/合并 |
 | 高清来源 | B 站 playurl dash | **InnerTube `android_vr`（钉死 1.65.10）** 直链；WEB 常仅 SABR |
 | 成品容器 | 主要为 MP4 | **MP4（H.264）或 WebM（VP9+Opus）** |
